@@ -1,0 +1,10 @@
+__pycache__/
+.idea/
+.vscode/
+logs/
+tmp_figs/
+parquet_files/
+python_vars/
+parameter_files/
+parameters.yaml
+aspire.err.log

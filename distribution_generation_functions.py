@@ -1,0 +1,201 @@
+import numpy as np
+from aspire.image import Image
+from aspire.volume import Volume
+import matplotlib.pyplot as plt
+from aspire.utils.rotation import Rotation
+
+
+def generate_spherical_fibonacci_spiral(t):
+    """
+    Generate points on the sphere S2 using a spherical t-design.
+    
+    Parameters:
+    -----------
+    t : int
+        The degree of the design. Higher values give more points and better distribution.
+    
+    Returns:
+    --------
+    points : ndarray
+        Array of 3D unit vectors representing points on S2
+    """
+    n = max(6 * t * t, 32)  # Number of points scales with t^2
+    
+    indices = np.arange(0, n, dtype=float) + 0.5
+    phi = np.arccos(1 - 2 * indices / n)
+    theta = np.pi * (1 + 5**0.5) * indices
+    
+    x = np.cos(theta) * np.sin(phi)
+    y = np.sin(theta) * np.sin(phi)
+    z = np.cos(phi)
+    
+    points = np.column_stack([x, y, z])
+    return points
+
+
+def generate_random_s2_points(num_points):
+    """
+    Generate random points on the sphere S2 in spherical coordinates.
+    
+    Parameters:
+    -----------
+    num_points : int
+        Number of points to generate on S2
+    
+    Returns:
+    --------
+    spherical_coords : ndarray
+        Array of shape (num_points, 2) containing (phi, theta) in spherical coordinates
+        phi: azimuthal angle [0, 2π]
+        theta: polar angle [0, π]
+    """
+    
+    # Generate random points on S2 using uniform sampling on the sphere
+    # Method: Generate random points in 3D and normalize to unit sphere
+    cartesian_points = np.random.randn(num_points, 3)
+    cartesian_points = cartesian_points / np.linalg.norm(cartesian_points, axis=1, keepdims=True)
+    
+    # Convert to spherical coordinates
+    # cartesian_points = [x, y, z] where x^2 + y^2 + z^2 = 1
+    theta = np.arccos(np.clip(cartesian_points[:, 2], -1, 1))  # Polar angle [0, π]
+    phi = np.arctan2(cartesian_points[:, 1], cartesian_points[:, 0])  # Azimuthal angle [-π, π]
+    
+    # Ensure phi is in [0, 2π]
+    phi = np.where(phi < 0, phi + 2*np.pi, phi)
+    
+    spherical_coords = np.column_stack([phi, theta])
+    return spherical_coords
+
+
+def generate_weighted_random_s2_points(num_points):
+    """
+    Generate random points on the sphere S2 with random non-uniform weights that sum to 1.
+    
+    Parameters:
+    -----------
+    num_points : int
+        Number of points to generate on S2
+    
+    Returns:
+    --------
+    s2_points : ndarray
+        Array of shape (num_points, 2) containing (phi, theta) in spherical coordinates
+        phi: azimuthal angle [0, 2π]
+        theta: polar angle [0, π]
+    weights : ndarray
+        Array of shape (num_points,) containing random weights that sum to 1
+    """
+    
+    # Generate random S2 points using the same method as generate_random_s2_points
+    cartesian_points = np.random.randn(num_points, 3)
+    cartesian_points = cartesian_points / np.linalg.norm(cartesian_points, axis=1, keepdims=True)
+    
+    # Convert to spherical coordinates
+    theta = np.arccos(np.clip(cartesian_points[:, 2], -1, 1))  # Polar angle [0, π]
+    phi = np.arctan2(cartesian_points[:, 1], cartesian_points[:, 0])  # Azimuthal angle [-π, π]
+    
+    # Ensure phi is in [0, 2π]
+    phi = np.where(phi < 0, phi + 2*np.pi, phi)
+    
+    s2_points = np.column_stack([phi, theta])
+    
+    # Generate random weights uniformly from [0,1] and normalize to sum to 1
+    weights = np.random.uniform(0, 1, num_points)
+    weights = weights / np.sum(weights)
+    
+    return s2_points, weights
+
+
+def create_in_plane_invariant_distribution(s2_spherical_coords, s2_weights=None, num_in_plane_rotations=8, is_s2_uniform=False):
+    """
+    Create a distribution from given S2 points (in spherical coordinates) with weights 
+    and uniform in-plane rotations.
+    
+    Parameters:
+    -----------
+    s2_spherical_coords : ndarray
+        Array of shape (num_s2_points, 2) containing (phi, theta) in spherical coordinates
+        phi: azimuthal angle [0, 2π]
+        theta: polar angle [0, π]
+    s2_weights : ndarray
+        Array of shape (num_s2_points,) containing weights for each S2 point
+        (ignored if is_s2_uniform=True)
+    num_in_plane_rotations : int
+        Number of uniform points for in-plane rotations
+    is_s2_uniform : bool
+        If True, ignore s2_weights and create uniform weights for S2 points
+    
+    Returns:
+    --------
+    rotations : Rotation
+        A set of rotations in SO(3) representing the distribution
+    distribution : ndarray
+        Array of weights for each rotation
+    """
+    num_s2_points = len(s2_spherical_coords)
+    
+    # Create uniform weights if requested
+    if is_s2_uniform or s2_weights is None:
+        s2_weights = np.ones(num_s2_points) / num_s2_points
+    
+    # Generate uniform in-plane rotation angles
+    in_plane_angles = np.linspace(0, 2*np.pi, num_in_plane_rotations, endpoint=False)
+    
+    # Create arrays to store all rotation parameters and weights using vectorized operations
+    total_rotations = num_s2_points * num_in_plane_rotations
+    
+    # Use meshgrid to create all combinations efficiently
+    phi_s2, psi_in_plane = np.meshgrid(s2_spherical_coords[:, 0], in_plane_angles, indexing='ij')
+    theta_s2, _ = np.meshgrid(s2_spherical_coords[:, 1], in_plane_angles, indexing='ij')
+    
+    # Flatten to get 1D arrays
+    phi_array = phi_s2.flatten()
+    theta_array = theta_s2.flatten()
+    psi_array = psi_in_plane.flatten()
+    
+    distribution = np.repeat(s2_weights / num_in_plane_rotations, num_in_plane_rotations)
+    
+    # Stack angles for ASPIRE's from_euler
+    euler_angles = np.stack([phi_array, theta_array, psi_array], axis=1)
+    # Create Rotation object (ZYZ convention)`)
+    rotations = Rotation.from_euler(euler_angles, dtype=np.float32)
+
+    return rotations, distribution
+
+
+if __name__ == "__main__":
+
+    from aspire.downloader import emdb_2660
+    
+    # Get a sample volume
+    vol_ds = emdb_2660().downsample(64)
+    L = vol_ds.resolution
+    
+    # Test the new distribution generation functions
+    print("Testing distribution generation functions")
+    
+    # Generate 3 random points on S2
+    s2_coords = generate_random_s2_points(num_points=3)
+    print(f"Generated {len(s2_coords)} random S2 points in spherical coordinates:")
+    print(f"S2 coordinates (phi, theta):\n{s2_coords}")
+    
+    # Create in-plane invariant distribution with 8 in-plane rotations
+    num_in_plane = 8
+    rotations, rotation_weights = create_in_plane_invariant_distribution(
+        s2_coords, None, num_in_plane_rotations=num_in_plane, is_s2_uniform=True
+    )
+    
+    print(f"\nCreated in-plane invariant distribution:")
+    print(f"Number of S2 points: {len(s2_coords)}")
+    print(f"Number of in-plane rotations per S2 point: {num_in_plane}")
+    print(f"Total number of rotations: {len(rotations)}")
+    print(f"Rotation weights sum: {np.sum(rotation_weights):.6f}")
+    print(f"First 5 rotation weights: {rotation_weights[:5]}")
+        
+    # Save the values for later usage
+    saved_rotations = rotations
+    saved_distribution = rotation_weights
+    
+    print(f"\nSaved rotations and distribution for later usage:")
+    print(f"saved_rotations: Rotation object with {len(saved_rotations)} rotations")
+    print(f"saved_distribution: Array of {len(saved_distribution)} weights")
