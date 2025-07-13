@@ -161,10 +161,10 @@ if __name__ == "__main__":
     trained_model.eval()
     with torch.no_grad():
         L = M1.shape[0]
-        M1_flat = M1.flatten().unsqueeze(0).unsqueeze(-1)
-        M2_reshaped = M2.view(L*L, L*L).unsqueeze(0)
+        M1_flat = M1.flatten().unsqueeze(0).unsqueeze(-1).to(device)
+        M2_reshaped = M2.view(L*L, L*L).unsqueeze(0).to(device)
         pred = trained_model(M2_reshaped, M1_flat)
-        target_batch = {k: v.unsqueeze(0) for k, v in target.items()}
+        target_batch = {k: v.unsqueeze(0).to(device) for k, v in target.items()}
         final_loss = general_distribution_loss(pred, target_batch, distribution_type)
         print(f"Final loss: {final_loss.item():.6f}")
         for k in pred:
