@@ -68,18 +68,19 @@ def load_data_from_parquet(parquet_path):
     return M1, M2, distribution_metadata, distribution_type, target
 
 
-def train_model(model, M1, M2, target, distribution_type, num_epochs, lr):
+def train_model(model, M1, M2, target, distribution_type, num_epochs, lr, device):
     """
     Train the VNN model on a single example.
-    
+
     Args:
         model: VNN model to train
         M1: First moment tensor (L, L)
         M2: Second moment tensor (L, L, L, L)
-        target_points: Target S2 points (num_points, 3)
-        target_weights: Target weights (num_points,)
+        target: Dictionary of target tensors
+        distribution_type: String specifying distribution type
         num_epochs: Number of training epochs
         lr: Learning rate
+        device: torch.device object (e.g. 'cuda:0' or 'cpu')
     """
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
@@ -89,16 +90,16 @@ def train_model(model, M1, M2, target, distribution_type, num_epochs, lr):
     
     L = M1.shape[0]  # Image resolution
     
-    # Flatten M1 and add batch and channel dimensions
+    # Flatten M1 and add batch and channel dimensions, then move to device
     M1_flat = M1.flatten()  # (L*L,)
-    M1_batch = M1_flat.unsqueeze(0).unsqueeze(-1)  # (1, L*L, 1)
+    M1_batch = M1_flat.unsqueeze(0).unsqueeze(-1).to(device)  # (1, L*L, 1)
     
     # Reshape M2 from (L, L, L, L) to (L*L, L*L) covariance matrix
     M2_reshaped = M2.view(L*L, L*L)  # (L*L, L*L)
-    M2_batch = M2_reshaped.unsqueeze(0)  # (1, L*L, L*L)
-    
+    M2_batch = M2_reshaped.unsqueeze(0).to(device)  # (1, L*L, L*L)
+
     # Prepare batch for all target fields
-    target_batch = {k: v.unsqueeze(0) for k, v in target.items()}
+    target_batch = {k: v.unsqueeze(0).to(device) for k, v in target.items()}
     print(f"Training shapes:")
     print(f"M1: {M1_batch.shape}")
     print(f"M2: {M2_batch.shape}")
@@ -139,7 +140,7 @@ if __name__ == "__main__":
     print(f"Distribution type: {distribution_type}")
     model = VNN(degree=settings.model.vnn_layer_degree,
                 hidden_dim=settings.model.hidden_dim,
-                distribution_metadata=distribution_metadata)
+                distribution_metadata=distribution_metadata).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
     # Load model if exists
     if os.path.exists(settings.model_paths.load_path):
@@ -151,7 +152,7 @@ if __name__ == "__main__":
     print("Starting training...")
     trained_model = train_model(model, M1, M2, target, distribution_type,
                                num_epochs=settings.training.num_epochs,
-                               lr=settings.training.learning_rate)
+                               lr=settings.training.learning_rate, device=device)
     # Save the trained model parameters
     torch.save(trained_model.state_dict(), settings.model_paths.save_path)
     print(f"Model parameters saved to: {settings.model_paths.save_path}")
