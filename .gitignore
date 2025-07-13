@@ -5,6 +5,6 @@ logs/
 tmp_figs/
 parquet_files/
 python_vars/
-parameter_files/
+model_parameter_files/
 parameters.yaml
 aspire.err.log

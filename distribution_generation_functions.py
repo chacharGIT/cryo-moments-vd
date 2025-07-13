@@ -5,33 +5,77 @@ import matplotlib.pyplot as plt
 from aspire.utils.rotation import Rotation
 
 
-def generate_spherical_fibonacci_spiral(t):
+def fibonacci_sphere_points(n: int):
     """
-    Generate points on the sphere S2 using a spherical t-design.
-    
-    Parameters:
-    -----------
-    t : int
-        The degree of the design. Higher values give more points and better distribution.
-    
-    Returns:
-    --------
-    points : ndarray
-        Array of 3D unit vectors representing points on S2
+    Generate N approximately uniformly distributed points on the unit sphere S²
+    using the Fibonacci (golden spiral) method.
+
+    Parameters
+    ----------
+    N : int
+        Number of points to generate.
+
+    Returns
+    -------
+    points : ndarray of shape (n, 3)
+        Cartesian coordinates of points on the unit sphere.
     """
-    n = max(6 * t * t, 32)  # Number of points scales with t^2
-    
-    indices = np.arange(0, n, dtype=float) + 0.5
-    phi = np.arccos(1 - 2 * indices / n)
-    theta = np.pi * (1 + 5**0.5) * indices
-    
-    x = np.cos(theta) * np.sin(phi)
-    y = np.sin(theta) * np.sin(phi)
-    z = np.cos(phi)
-    
-    points = np.column_stack([x, y, z])
+    phi = (1 + np.sqrt(5)) / 2  # golden ratio
+    i = np.arange(n)
+
+    z = 1 - (2*i + 1)/n                 # z-coordinates (from north to south)
+    theta = 2 * np.pi * i / phi        # golden angle increments
+    r = np.sqrt(1 - z**2)              # radius at each height
+
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+
+    points = np.column_stack((x, y, z))
     return points
 
+def cartesian_to_spherical(points):
+    """
+    Convert normalized points in R^3 to spherical coordinates (phi, theta).
+    Assumes input points are normalized (on the unit sphere).
+
+    Parameters:
+    -----------
+    points : ndarray
+        Array of shape (N, 3) representing N points in R^3.
+
+    Returns:
+    --------
+    spherical_coords : ndarray
+        Array of shape (N, 2), where each row is (phi, theta).
+        phi in [0, 2*pi), theta in [0, pi].
+    """
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    theta = np.arccos(np.clip(z, -1, 1))
+    phi = np.arctan2(y, x)
+    phi = np.where(phi < 0, phi + 2 * np.pi, phi)
+    return np.column_stack([phi, theta])
+
+def cartesian_to_spherical(points):
+    """
+    Convert normalized points in R^3 to spherical coordinates (phi, theta).
+    Assumes input points are normalized (on the unit sphere).
+
+    Parameters:
+    -----------
+    points : ndarray
+        Array of shape (N, 3) representing N points in R^3.
+
+    Returns:
+    --------
+    spherical_coords : ndarray
+        Array of shape (N, 2), where each row is (phi, theta).
+        phi in [0, 2*pi), theta in [0, pi].
+    """
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    theta = np.arccos(np.clip(z, -1, 1))
+    phi = np.arctan2(y, x)
+    phi = np.where(phi < 0, phi + 2 * np.pi, phi)
+    return np.column_stack([phi, theta])
 
 def generate_random_s2_points(num_points):
     """

@@ -4,7 +4,7 @@ import torch.optim as optim
 import numpy as np
 import pyarrow.parquet as pq
 import os
-from moments_vnn import VNN, permutation_invariant_loss, l2_norm_loss
+from moments_vnn import VNN, general_distribution_loss
 from config import settings
 
 
@@ -35,18 +35,40 @@ def load_data_from_parquet(parquet_path):
     second_moment_shape = data['second_moment_shape'].iloc[0]
     M2 = torch.tensor(second_moment_flat.reshape(second_moment_shape), dtype=torch.float32)
     
-    # Extract S2 points and weights directly from the parquet file
-    s2_points_3d = np.array(data['s2_points'].iloc[0])
-    s2_weights = np.array(data['s2_weights'].iloc[0])
-    num_s2_points = data['num_s2_points'].iloc[0]
-    
-    target_points = torch.tensor(np.stack(s2_points_3d), dtype=torch.float32)
-    target_weights = torch.tensor(s2_weights, dtype=torch.float32)
-    
-    return M1, M2, target_points, target_weights
+    # Determine distribution type and load metadata accordingly
+    distribution_type = data['distribution_type'].iloc[0]
+    if distribution_type == 's2_delta_mixture':
+        s2_weights = np.array(data['s2_weights'].iloc[0])
+        s2_points = np.array(data['s2_points'].iloc[0])
+        distribution_metadata = {
+            'type': 's2_delta_mixture',
+            's2_weights': s2_weights,
+            's2_points': s2_points
+        }
+        target = {'s2_weights': torch.tensor(s2_weights, dtype=torch.float32)}
+    elif distribution_type == 'vmf_mixture':
+        means = np.array(data['von_mises_mu_directions'].iloc[0])
+        means = np.stack(means).astype(np.float32)
+        kappas = np.array(data['von_mises_kappa_values'].iloc[0])
+        kappas = np.stack(kappas).astype(np.float32)
+        weights = np.array(data['von_mises_mixture_weights'].iloc[0])
+        weights = np.stack(weights).astype(np.float32)
+        distribution_metadata = {
+            'type': 'vmf_mixture',
+            'means': means,
+            'kappas': kappas,
+            'von_mises_mixture_weights': weights
+        }
+        target = {'means': torch.tensor(means),
+                  'kappas': torch.tensor(kappas),
+                  'weights': torch.tensor(weights)}
+    else:
+        raise ValueError(f"Unrecognized or missing distribution_type in parquet file: {distribution_type}")
+
+    return M1, M2, distribution_metadata, distribution_type, target
 
 
-def train_model(model, M1, M2, target_points, target_weights, num_epochs=1000, lr=0.001):
+def train_model(model, M1, M2, target, distribution_type, num_epochs, lr):
     """
     Train the VNN model on a single example.
     
@@ -75,101 +97,76 @@ def train_model(model, M1, M2, target_points, target_weights, num_epochs=1000, l
     M2_reshaped = M2.view(L*L, L*L)  # (L*L, L*L)
     M2_batch = M2_reshaped.unsqueeze(0)  # (1, L*L, L*L)
     
-    target_points_batch = target_points.unsqueeze(0)  # (1, num_points, 3)
-    target_weights_batch = target_weights.unsqueeze(0)  # (1, num_points)
-    
+    # Prepare batch for all target fields
+    target_batch = {k: v.unsqueeze(0) for k, v in target.items()}
     print(f"Training shapes:")
     print(f"M1: {M1_batch.shape}")
     print(f"M2: {M2_batch.shape}")
-    print(f"Target points: {target_points_batch.shape}")
-    print(f"Target weights: {target_weights_batch.shape}")
+    for k, v in target_batch.items():
+        print(f"Target {k}: {v.shape}")
     
     model.train()
     
     for epoch in range(num_epochs):
         optimizer.zero_grad()
-        
         # Forward pass
-        pred_points, pred_weights = model(M2_batch, M1_batch)
-        
-        # Compute both losses
-        l2_loss = l2_norm_loss(pred_points, pred_weights, 
-                              target_points_batch, target_weights_batch)
-        
-        # Combine losses (you can adjust the weighting as needed)
-        loss =  l2_loss
+        pred = model(M2_batch, M1_batch)
+        # Compute loss
+        loss = general_distribution_loss(pred, target_batch, distribution_type)
         loss.backward()
         optimizer.step()
-        
         if epoch % settings.logging.print_interval == 0:
             print(f"Epoch {epoch:4d}, Loss: {loss.item()}")
-            
-            # Print some predictions for monitoring
             if settings.logging.verbose:
                 with torch.no_grad():
-                    print(f"  Predicted weights: {pred_weights[0].detach().numpy()}")
-                    print(f"  Target weights:    {target_weights.numpy()}")
-                    print(f"  Predicted points (first 3 coords of first point): {pred_points[0, 0].detach().numpy()}")
-                    print(f"  Target points (first 3 coords of first point):    {target_points[0].numpy()}")
-    
+                    for k in pred:
+                        print(f"  Predicted {k}: {pred[k][0].detach().cpu().numpy()}")
+                    for k in target_batch:
+                        print(f"  Target {k}:    {target_batch[k][0].cpu().numpy()}")
     return model
 
 
-def main():
+if __name__ == "__main__":
+    device = torch.device(
+        f"cuda:{settings.device.cuda_device}" 
+        if settings.device.use_cuda and torch.cuda.is_available() 
+        else "cpu"
+    )
+    print(f"Using device: {device}")
     # Load data from parquet file
     print(f"Loading data from {settings.data.parquet_path}...")
-    M1, M2, target_points, target_weights = load_data_from_parquet(settings.data.parquet_path)
-    
-    # Get number of S2 points from target data
-    num_s2_points = target_points.shape[0]
-    print(f"Number of S2 points: {num_s2_points}")
-    
-    # Create VNN model
-    model = VNN(degree=settings.model.vnn_layer_degree, 
-                hidden_dim=settings.model.hidden_dim, 
-                num_s2_points=num_s2_points)
-    
+    M1, M2, distribution_metadata, distribution_type, target = load_data_from_parquet(settings.data.parquet_path)
+    print(f"Distribution type: {distribution_type}")
+    model = VNN(degree=settings.model.vnn_layer_degree,
+                hidden_dim=settings.model.hidden_dim,
+                distribution_metadata=distribution_metadata)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
-
     # Load model if exists
     if os.path.exists(settings.model_paths.load_path):
         model.load_state_dict(torch.load(settings.model_paths.load_path))
         print(f"Loaded model parameters from: {settings.model_paths.load_path}")
     else:
         print(f"No saved model found. Training from scratch.")
-
     # Train the model
     print("Starting training...")
-    trained_model = train_model(model, M1, M2, target_points, target_weights, 
-                               num_epochs=settings.training.num_epochs, 
+    trained_model = train_model(model, M1, M2, target, distribution_type,
+                               num_epochs=settings.training.num_epochs,
                                lr=settings.training.learning_rate)
-    
     # Save the trained model parameters
     torch.save(trained_model.state_dict(), settings.model_paths.save_path)
     print(f"Model parameters saved to: {settings.model_paths.save_path}")
-    
     # Final evaluation
     print("\nFinal evaluation:")
     trained_model.eval()
     with torch.no_grad():
-        # Prepare input
         L = M1.shape[0]
-        M1_flat = M1.flatten().unsqueeze(0).unsqueeze(-1)  # (1, L*L, 1)
-        M2_reshaped = M2.view(L*L, L*L).unsqueeze(0)  # (1, L*L, L*L)
-        
-        pred_points, pred_weights = trained_model(M2_reshaped, M1_flat)
-        
-        final_loss = l2_norm_loss(pred_points, pred_weights,
-                                              target_points.unsqueeze(0), target_weights.unsqueeze(0))
-        
+        M1_flat = M1.flatten().unsqueeze(0).unsqueeze(-1)
+        M2_reshaped = M2.view(L*L, L*L).unsqueeze(0)
+        pred = trained_model(M2_reshaped, M1_flat)
+        target_batch = {k: v.unsqueeze(0) for k, v in target.items()}
+        final_loss = general_distribution_loss(pred, target_batch, distribution_type)
         print(f"Final loss: {final_loss.item():.6f}")
-        print(f"Final predicted weights: {pred_weights[0].numpy()}")
-        print(f"Target weights:          {target_weights.numpy()}")
-        
-        # Check if points are on unit sphere
-        pred_norms = torch.norm(pred_points[0], dim=1)
-        print(f"Predicted point norms (should be ~1.0): {pred_norms.numpy()}")
-
-
-if __name__ == "__main__":
-    main()
+        for k in pred:
+            print(f"Final predicted {k}: {pred[k][0].cpu().numpy()}")
+        for k in target_batch:
+            print(f"Target {k}:          {target_batch[k][0].cpu().numpy()}")

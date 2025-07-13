@@ -9,11 +9,11 @@ import matplotlib.pyplot as plt
 class VolumeDistributionModel:
     """
     A class containing all the data necessary to solve the Cryo-EM problem.
-    
+
     This class encapsulates a volume, a set of rotations (quadrature rule),
     and a probability distribution over those rotations. It provides methods
     to generate noisy projections of the volume.
-    
+
     Attributes:
     -----------
     volume : Volume
@@ -22,28 +22,51 @@ class VolumeDistributionModel:
         A set of rotations in SO(3) (quadrature rule)
     distribution : ndarray
         The probability distribution associated with each rotation
-    s2_points : ndarray, optional
-        S2 points in 3D Cartesian coordinates from which the distribution was generated
-    s2_weights : ndarray, optional
-        Weights for each S2 point from which the distribution was generated
+    distribution_metadata : dict, optional
+        Dictionary describing how the distribution was generated.
+        The required keys depend on the generation method. Supported formats:
+
+        - For "s2_delta_mixture":
+            {
+                "type": "s2_delta_mixture",
+                "s2_points": ndarray of shape (K, 3),
+                "s2_weights": ndarray of shape (K,)
+            }
+
+        - For "vmf_mixture":
+            {
+                "type": "vmf_mixture",
+                "means": ndarray of shape (K, 3),
+                "kappas": ndarray of shape (K,),
+                "weights": ndarray of shape (K,)
+            }
     """
-    
+
     def __init__(self, volume: Volume, rotations: Rotation, distribution: np.ndarray, 
-                 s2_points=None, s2_weights=None):
+                 distribution_metadata=None):
         self.volume = volume
         self.rotations = rotations
-        
-        # Normalize distribution if not already normalized
-        if np.abs(np.sum(distribution) - 1.0) > 1e-10:
-            self.distribution = distribution / np.sum(distribution)
-        else:
-            self.distribution = distribution
-            
-        # Store S2 information if provided
-        self.s2_points = s2_points  # 3D Cartesian coordinates on unit sphere
-        self.s2_weights = s2_weights
-    
-    def generate_noisy_projections(self, num_projections=10, sigma=0.1):
+        self.distribution = self.normalize_distribution(distribution)
+        # Store general distribution metadata (must be a dict with a 'type' key)
+        if distribution_metadata is not None:
+            if not isinstance(distribution_metadata, dict):
+                raise ValueError("distribution_metadata must be a dictionary if provided.")
+            if 'type' not in distribution_metadata:
+                raise ValueError("distribution_metadata must contain a 'type' key.")
+        self.distribution_metadata = distribution_metadata
+
+    @staticmethod
+    def normalize_distribution(distribution):
+        """
+        Normalize a probability distribution to sum to 1 (if not already normalized).
+        """
+        distribution = np.asarray(distribution)
+        total = np.sum(distribution)
+        if np.abs(total - 1.0) > 1e-10:
+            return distribution / total
+        return distribution
+
+    def generate_noisy_projections(self, num_projections, sigma):
         """
         Generate multiple noisy projections of the volume from randomly sampled rotations.
         """
