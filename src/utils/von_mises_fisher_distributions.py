@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.special import ive
-from config import settings
-from distribution_generation_functions import cartesian_to_spherical, create_in_plane_invariant_distribution
+from config.config import settings
+from src.utils.distribution_generation_functions import cartesian_to_spherical, create_in_plane_invariant_distribution
 
 def von_mises_fisher_normalization_constant(kappa):
     """
@@ -176,25 +176,25 @@ def so3_distribution_from_von_mises_mixture(quadrature_points, mu_directions, ka
     return rotations, distribution
 
 if __name__ == "__main__":
-    from distribution_generation_functions import fibonacci_sphere_points
-    from volume_distribution_model import VolumeDistributionModel
+    from src.utils.distribution_generation_functions import fibonacci_sphere_points
+    from src.core.volume_distribution_model import VolumeDistributionModel
     from aspire.downloader import emdb_2660
     
     print("von-Mises Fisher Distribution Pipeline")
 
     # Generate S2 quadrature points
-    quadrature_points = fibonacci_sphere_points(n=settings.von_mises_fisher.fibonacci_spiral_n)
+    quadrature_points = fibonacci_sphere_points(n=settings.data_generation.von_mises_fisher.fibonacci_spiral_n)
     print(f"Generated {len(quadrature_points)} S2 quadrature points")
     
     # Generate von-Mises Fisher parameters
-    num_vmf = settings.von_mises_fisher.num_distributions
+    num_vmf = settings.data_generation.von_mises_fisher.num_distributions
     mu_directions, kappa_values, mixture_weights = generate_random_von_mises_fisher_parameters(
-        num_vmf, kappa_range=tuple(settings.von_mises_fisher.kappa_range)
+        num_vmf, kappa_range=tuple(settings.data_generation.von_mises_fisher.kappa_range)
     )
     
     # Create SO(3) distribution and S2 weights from von Mises mixture
     rotations, rotation_weights, s2_weights = so3_distribution_from_von_mises_mixture(
-        quadrature_points, mu_directions, kappa_values, mixture_weights, settings.von_mises_fisher.num_in_plane_rotations
+        quadrature_points, mu_directions, kappa_values, mixture_weights, settings.data_generation.von_mises_fisher.num_in_plane_rotations
     )
 
     print(f"Created {num_vmf} von-Mises Fisher mixture, kappa range: [{np.min(kappa_values):.2f}, {np.max(kappa_values):.2f}]")

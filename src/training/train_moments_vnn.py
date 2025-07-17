@@ -4,8 +4,8 @@ import torch.optim as optim
 import numpy as np
 import pyarrow.parquet as pq
 import os
-from moments_vnn import VNN, general_distribution_loss
-from config import settings
+from src.networks.moments_vnn import VNN, general_distribution_loss
+from config.config import settings
 
 
 def load_data_from_parquet(parquet_path):
@@ -135,17 +135,17 @@ if __name__ == "__main__":
     )
     print(f"Using device: {device}")
     # Load data from parquet file
-    print(f"Loading data from {settings.data.parquet_path}...")
-    M1, M2, distribution_metadata, distribution_type, target = load_data_from_parquet(settings.data.parquet_path)
+    print(f"Loading data from {settings.data_generation.parquet_path}...")
+    M1, M2, distribution_metadata, distribution_type, target = load_data_from_parquet(settings.data_generation.parquet_path)
     print(f"Distribution type: {distribution_type}")
-    model = VNN(degree=settings.model.vnn_layer_degree,
-                hidden_dim=settings.model.hidden_dim,
+    model = VNN(degree=settings.model.architecture.vnn_layer_degree,
+                hidden_dim=settings.model.architecture.hidden_dim,
                 distribution_metadata=distribution_metadata).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
     # Load model if exists
-    if os.path.exists(settings.model_paths.load_path):
-        model.load_state_dict(torch.load(settings.model_paths.load_path))
-        print(f"Loaded model parameters from: {settings.model_paths.load_path}")
+    if os.path.exists(settings.model.checkpoint.load_path):
+        model.load_state_dict(torch.load(settings.model.checkpoint.load_path))
+        print(f"Loaded model parameters from: {settings.model.checkpoint.load_path}")
     else:
         print(f"No saved model found. Training from scratch.")
     # Train the model
@@ -154,8 +154,8 @@ if __name__ == "__main__":
                                num_epochs=settings.training.num_epochs,
                                lr=settings.training.learning_rate, device=device)
     # Save the trained model parameters
-    torch.save(trained_model.state_dict(), settings.model_paths.save_path)
-    print(f"Model parameters saved to: {settings.model_paths.save_path}")
+    torch.save(trained_model.state_dict(), settings.model.checkpoint.save_path)
+    print(f"Model parameters saved to: {settings.model.checkpoint.save_path}")
     # Final evaluation
     print("\nFinal evaluation:")
     trained_model.eval()
@@ -170,4 +170,4 @@ if __name__ == "__main__":
         for k in pred:
             print(f"Final predicted {k}: {pred[k][0].cpu().numpy()}")
         for k in target_batch:
-            print(f"Target {k}:          {target_batch[k][0].cpu().numpy()}")
+            print(f"Target {k}: {target_batch[k][0].cpu().numpy()}")

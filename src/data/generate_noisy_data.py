@@ -5,9 +5,9 @@ import pyarrow.parquet as pq
 from aspire.volume import Volume
 from aspire.utils.rotation import Rotation
 from aspire.downloader import emdb_2660
-from volume_distribution_model import VolumeDistributionModel
-from distribution_generation_functions import generate_weighted_random_s2_points, create_in_plane_invariant_distribution
-from config import settings
+from src.core.volume_distribution_model import VolumeDistributionModel
+from src.utils.distribution_generation_functions import generate_weighted_random_s2_points, create_in_plane_invariant_distribution
+from config.config import settings
 
 
 def generate_and_save_noisy_data(vdm: VolumeDistributionModel, num_images, output_path, sigma=0.1, downsample_size=64):
@@ -69,12 +69,12 @@ if __name__ == "__main__":
     
     # Generate random S2 points with non-uniform weights using the new function
     s2_coords, s2_weights = generate_weighted_random_s2_points(
-        num_points=settings.noisy_data_generation.num_points_s2
+        num_points=settings.data_generation.noisy.num_points_s2
     )
     
     # Create in-plane invariant distribution with the weighted S2 points
     rotations, distribution = create_in_plane_invariant_distribution(
-        s2_coords, s2_weights, num_in_plane_rotations=settings.noisy_data_generation.num_points_s1, is_s2_uniform=False
+        s2_coords, s2_weights, num_in_plane_rotations=settings.data_generation.noisy.num_points_s1, is_s2_uniform=False
     )
     
     # Convert S2 spherical coordinates to 3D Cartesian coordinates
@@ -89,8 +89,8 @@ if __name__ == "__main__":
     
     generate_and_save_noisy_data(
         vdm,
-        settings.noisy_data_generation.num_images,
-        settings.noisy_data_generation.output_path,
-        settings.noisy_data_generation.sigma,
+        settings.data_generation.noisy.num_images,
+        settings.data_generation.noisy.output_path,
+        settings.data_generation.noisy.sigma,
         settings.data_generation.downsample_size
     )

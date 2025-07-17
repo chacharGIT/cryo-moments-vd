@@ -1,16 +1,17 @@
 import numpy as np
+import torch
 import os
 import pickle
 import pyarrow as pa
 import pyarrow.parquet as pq
 from aspire.downloader import emdb_2660
-from volume_distribution_model import VolumeDistributionModel
-from distribution_generation_functions import fibonacci_sphere_points
-from von_mises_fisher_distributions import (
+from src.core.volume_distribution_model import VolumeDistributionModel
+from src.utils.distribution_generation_functions import fibonacci_sphere_points
+from src.utils.von_mises_fisher_distributions import (
     generate_random_von_mises_fisher_parameters,
     so3_distribution_from_von_mises_mixture
 )
-from config import settings
+from config.config import settings
 
 
 def save_vdm_pickle(vdm: VolumeDistributionModel, output_path):
@@ -48,8 +49,9 @@ def save_distribution_data(vdm: VolumeDistributionModel, output_path):
         Path where the parquet file will be saved
     """
     print("Calculating analytical moments")
-    A_1 = vdm.first_analytical_moment()
-    A_2 = vdm.second_analytical_moment()
+    A_1 = vdm.first_analytical_moment(device=settings.device.cuda_device)
+    A_2 = vdm.second_analytical_moment(batch_size=settings.data_generation.second_moment_batch_size,
+                                        show_progress=True, device=settings.device.cuda_device)
     print(f"First moment shape: {A_1.shape}, Second moment shape: {A_2.shape}")
 
     # Flatten the moments for storage
@@ -106,17 +108,17 @@ if __name__ == "__main__":
     print(f"Volume resolution: {vol.resolution}")
 
     # Generate S2 quadrature points
-    quadrature_points = fibonacci_sphere_points(n=settings.von_mises_fisher.fibonacci_spiral_n)
+    quadrature_points = fibonacci_sphere_points(n=settings.data_generation.von_mises_fisher.fibonacci_spiral_n)
 
     # Generate von-Mises Fisher mixture parameters
-    num_vmf = settings.von_mises_fisher.num_distributions
+    num_vmf = settings.data_generation.von_mises_fisher.num_distributions
     mu_directions, kappa_values, mixture_weights = generate_random_von_mises_fisher_parameters(
-        num_vmf, kappa_range=tuple(settings.von_mises_fisher.kappa_range)
+        num_vmf, kappa_range=tuple(settings.data_generation.von_mises_fisher.kappa_range)
     )
 
     # Create SO(3) distribution and S2 weights from von Mises mixture
     rotations, distribution = so3_distribution_from_von_mises_mixture(
-        quadrature_points, mu_directions, kappa_values, mixture_weights, settings.von_mises_fisher.num_in_plane_rotations
+        quadrature_points, mu_directions, kappa_values, mixture_weights, settings.data_generation.von_mises_fisher.num_in_plane_rotations
     )
 
     # Create the VolumeDistributionModel with S2 points and weights
@@ -134,8 +136,8 @@ if __name__ == "__main__":
     
     # Save all distribution data, including von Mises mixture parameters
     print("Saving distribution data parquet file")
-    save_distribution_data(vdm, settings.data.parquet_path)
+    save_distribution_data(vdm, settings.data_generation.parquet_path)
 
     # Also save the VDM object as pickle
-    pickle_path = settings.data.parquet_path.replace('.parquet', '_vdm.pkl')
+    pickle_path = settings.data_generation.parquet_path.replace('.parquet', '_vdm.pkl')
     save_vdm_pickle(vdm, pickle_path)

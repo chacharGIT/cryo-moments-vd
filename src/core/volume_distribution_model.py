@@ -1,9 +1,12 @@
-from operator import le
+from tqdm import tqdm
 import numpy as np
+import torch
+import torch
 from aspire.image import Image
 from aspire.volume import Volume
 from aspire.utils.rotation import Rotation
 import matplotlib.pyplot as plt
+from src.utils.distribution_generation_functions import generate_weighted_random_s2_points, create_in_plane_invariant_distribution
 
 
 class VolumeDistributionModel:
@@ -83,53 +86,67 @@ class VolumeDistributionModel:
         
         return noisy_projections, sampled_rotations
     
-    def first_analytical_moment(self):
+    def first_analytical_moment(self, device=None):
         """
-        Calculate the first analytical moment by summing weighted projections.
+        Calculate the first analytical moment
+        
+        Returns:
+        --------
+        first_moment : ndarray of shape (L, L)
+            The computed first analytical moment.
         """
-        # Get resolution from volume
         L = self.volume.resolution
-        
-        # Initialize the first moment
-        first_moment = np.zeros((L, L), dtype=self.volume.dtype)
-        
-        # For each rotation in the quadrature
-        for i, rotation in enumerate(self.rotations):
-            # Project the volume using the rotation
-            projection = self.volume.project(rotation).asnumpy()
-            
-            # Add the weighted projection to the first moment
-            # Extract the first (and only) image from the projection
-            first_moment += self.distribution[i] * projection[0]
-    
-        return first_moment
+        # Batch project all rotations
+        projections = self.volume.project(self.rotations).asnumpy().copy()  # shape: (N, L, L), ensure writeable
+        weights = self.distribution
+        # Move to torch and device
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        projections_t = torch.from_numpy(projections).to(device=device, dtype=torch.float32)
+        weights_t = torch.from_numpy(weights).to(device=device, dtype=torch.float32)
+        # Weighted sum
+        weighted_projections = projections_t * weights_t[:, None, None]
+        first_moment = torch.sum(weighted_projections, dim=0)
+        return first_moment.cpu().numpy()
 
 
-    def second_analytical_moment(self):
+    def second_analytical_moment(self, batch_size=10, show_progress=False, device=None):
         """
-        Calculate the second analytical moment by summing outer products of weighted projections.
-        """        
-        # Get resolution from volume
+        Calculate the second analytical moment in batches to avoid memory blowup.
+
+        Parameters:
+        -----------
+        batch_size : int
+            Number of projections to process per batch.
+
+        Returns:
+        --------
+        second_moment : ndarray of shape (L, L, L, L)
+            The computed second analytical moment.
+        """
         L = self.volume.resolution
+        N = len(self.rotations)
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        second_moment = torch.zeros((L, L, L, L), dtype=torch.float32, device=device)
+        projections = self.volume.project(self.rotations).asnumpy().copy()  # shape: (N, L, L), ensure writeable
+        projections_t = torch.from_numpy(projections).to(device=device, dtype=torch.float32)
+        weights_t = torch.from_numpy(self.distribution).to(device=device, dtype=torch.float32)
+
+        iterator = range(0, N, batch_size)
+        if show_progress:
+            iterator = tqdm(iterator, total=(N + batch_size - 1) // batch_size, desc="Second Moment", leave=False)
+        for start_idx in iterator:
+            end_idx = min(start_idx + batch_size, N)
+            batch_projs = projections_t[start_idx:end_idx]  # (B, L, L)
+            batch_weights = weights_t[start_idx:end_idx]  # (B,)
+            # Compute weighted outer products for this batch
+            # einsum: bij,bkl->bijkl
+            outer = torch.einsum('bij,bkl->bijkl', batch_projs, batch_projs)
+            weighted_outer = batch_weights[:, None, None, None, None] * outer
+            second_moment += torch.sum(weighted_outer, dim=0)
+        return second_moment.cpu().numpy()
         
-        # Initialize the second moment
-        second_moment = np.zeros((L, L, L, L), dtype=self.volume.dtype)
-        
-        # For each rotation in the quadrature
-        for i, rotation in enumerate(self.rotations):
-            # Project the volume using the rotation
-            projection = self.volume.project(rotation).asnumpy()
-            proj_data = projection[0]
-            
-            # Compute the outer product of the projection with itself
-            # (i,j) ⊗ (k,l) → (i,j,k,l)
-            outer_product = np.einsum('ij,kl->ijkl', proj_data, proj_data)
-            
-            # Add the weighted outer product to the second moment
-            second_moment += self.distribution[i] * outer_product
-        
-        return second_moment
-    
     def save_projections(self, projections, filename_prefix="projection", save_dir="tmp_figs"):
         """
         Save projection images to files.
@@ -163,34 +180,37 @@ class VolumeDistributionModel:
 
 if __name__ == "__main__":
     from aspire.downloader import emdb_2660
-    from distribution_generation_functions import generate_weighted_random_s2_points, create_in_plane_invariant_distribution
-    
+    from src.utils.distribution_generation_functions import generate_weighted_random_s2_points, create_in_plane_invariant_distribution
+    from config.config import settings
+
     # Get a sample volume
-    vol_ds = emdb_2660().downsample(64)
+    vol_ds = emdb_2660().downsample(settings.data_generation.downsample_size)
     L = vol_ds.resolution
-    
+
     # Generate random S2 points with non-uniform weights using the new function
-    s2_coords, s2_weights = generate_weighted_random_s2_points(num_points=3)
+    s2_coords, s2_weights = generate_weighted_random_s2_points(num_points=settings.data_generation.s2_delta_mixture.num_s2_points)
     print(f"Generated {len(s2_coords)} random S2 points with non-uniform weights:")
     print(f"S2 coordinates (phi, theta):\n{s2_coords}")
     print(f"S2 weights: {s2_weights}")
     print(f"Weights sum: {np.sum(s2_weights):.6f}")
-    
-    # Create in-plane invariant distribution with 8 in-plane rotations using the weighted S2 points
-    num_in_plane = 8
+
+    # Create in-plane invariant distribution with in-plane rotations using the weighted S2 points
     rotations, rotation_weights = create_in_plane_invariant_distribution(
-        s2_coords, s2_weights, num_in_plane_rotations=num_in_plane, is_s2_uniform=False
+        s2_coords, s2_weights, num_in_plane_rotations=settings.data_generation.s2_delta_mixture.num_in_plane_rotations, is_s2_uniform=False
     )
-    vdm = VolumeDistributionModel(vol_ds, rotations, rotation_weights)
+    vdm = VolumeDistributionModel(vol_ds, rotations, rotation_weights, distribution_metadata={
+        'type': 's2_delta_mixture',
+        's2_points': s2_coords,
+        's2_weights': s2_weights
+    })
 
     # Generate a single noisy projection
-    projection, rotation = vdm.generate_noisy_projections(num_projections=1, sigma=0.05)
+    projection, rotation = vdm.generate_noisy_projections(num_projections=1, sigma=settings.data_generation.noisy.sigma)
     print(f"Generated a single projection with shape {projection[0].shape}")
 
-        
     # Calculate analytical moments using the quadrature
     A_1 = vdm.first_analytical_moment()
     print("Analytical first moment shape:", A_1.shape)
-    
+
     A_2 = vdm.second_analytical_moment()
     print("Analytical second moment shape:", A_2.shape)

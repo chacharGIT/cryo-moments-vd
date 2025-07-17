@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vnn_layer import VNNLayer
+from src.networks.vnn_layer import VNNLayer
 
 
 
