@@ -57,7 +57,26 @@ class VolumeDistributionModel:
             if 'type' not in distribution_metadata:
                 raise ValueError("distribution_metadata must contain a 'type' key.")
         self.distribution_metadata = distribution_metadata
-
+    @staticmethod
+    def compute_mask(proj, sigma=0.01, chan_vese_iters=500):
+        """
+        Compute the inside and outside mask for a given projection using Gaussian smoothing, Chan-Vese segmentation,
+        and binary dilation of the inverted mask.
+        """
+        from skimage.segmentation import morphological_chan_vese
+        from scipy.ndimage import gaussian_filter, binary_dilation
+        import numpy as np
+        # Smooth and normalize
+        proj_smoothed = gaussian_filter(proj, sigma=sigma)
+        proj_norm = (proj_smoothed - np.min(proj_smoothed)) / (np.max(proj_smoothed) - np.min(proj_smoothed) + 1e-8)
+        # Otsu's threshold for initialization
+        from skimage.filters import threshold_otsu
+        otsu_thresh = threshold_otsu(proj_norm)
+        init_ls = proj_norm > otsu_thresh
+        inside_mask = morphological_chan_vese(image=proj_norm, num_iter=chan_vese_iters, init_level_set=init_ls, smoothing=1, lambda1=1, lambda2=10)
+        inside_mask = inside_mask.astype(bool)
+        outside_mask = ~inside_mask.astype(bool)
+        return inside_mask, outside_mask
     @staticmethod
     def normalize_distribution(distribution):
         """
@@ -110,7 +129,7 @@ class VolumeDistributionModel:
         return first_moment.cpu().numpy()
 
 
-    def second_analytical_moment(self, batch_size=10, show_progress=False, device=None):
+    def second_analytical_moment(self, batch_size=10, show_progress=False, device=None, dtype=torch.float32):
         """
         Calculate the second analytical moment in batches to avoid memory blowup.
 
@@ -118,6 +137,12 @@ class VolumeDistributionModel:
         -----------
         batch_size : int
             Number of projections to process per batch.
+        show_progress : bool
+            Whether to show a progress bar.
+        device : str, optional
+            Device to use for computation ('cuda' or 'cpu'). If None, uses GPU if available.
+        dtype : torch.dtype
+            Data type for computation (e.g., torch.float32 or torch.float64).
 
         Returns:
         --------
@@ -128,10 +153,10 @@ class VolumeDistributionModel:
         N = len(self.rotations)
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        second_moment = torch.zeros((L, L, L, L), dtype=torch.float32, device=device)
+        second_moment = torch.zeros((L, L, L, L), dtype=dtype, device=device)
         projections = self.volume.project(self.rotations).asnumpy().copy()  # shape: (N, L, L), ensure writeable
-        projections_t = torch.from_numpy(projections).to(device=device, dtype=torch.float32)
-        weights_t = torch.from_numpy(self.distribution).to(device=device, dtype=torch.float32)
+        projections_t = torch.from_numpy(projections).to(device=device, dtype=dtype)
+        weights_t = torch.from_numpy(self.distribution).to(device=device, dtype=dtype)
 
         iterator = range(0, N, batch_size)
         if show_progress:
@@ -176,41 +201,151 @@ class VolumeDistributionModel:
             plt.savefig(filename, dpi=150, bbox_inches='tight')
             plt.close()
             print(f"Saved projection {i} to {filename}")
+
+    def projections_correlation(self, rotation1=None, rotation2=None, return_rotations=False):
+        """
+        Measure the normalized inner product (cosine similarity) between two projections of the volume for different directions.
+
+        Parameters:
+        -----------
+        rotation1 : Rotation or None
+            First rotation. If None, a random rotation is sampled from the distribution.
+        rotation2 : Rotation or None
+            Second rotation. If None, a random rotation is sampled from the distribution.
+
+        Returns:
+        --------
+        corr : float
+            Normalized inner product (cosine similarity) between the two projection images.
+        """
+        if (rotation1 is None) or (rotation2 is None):
+            idx1 = np.random.choice(len(self.rotations), p=self.distribution)
+            rotation1 = self.rotations[idx1]
+            idx2 = np.random.choice(len(self.rotations), p=self.distribution)
+            rotation2 = self.rotations[idx2]
+
+        # Project the volume for each rotation
+        proj1 = self.volume.project(rotation1).asnumpy().squeeze()
+        proj2 = self.volume.project(rotation2).asnumpy().squeeze()
+    
+        inside_mask1, outside_mask1 = self.compute_mask(proj1)
+        proj1 = proj1.copy()
+        if np.any(inside_mask1):
+            mean_inside1 = np.mean(proj1[inside_mask1])
+            proj1[inside_mask1] = proj1[inside_mask1] - mean_inside1
+        if np.any(outside_mask1):
+            mean_outside1 = np.mean(proj1[outside_mask1])
+            proj1[outside_mask1] = proj1[outside_mask1] - mean_outside1
+        inside_mask2, outside_mask2 = self.compute_mask(proj2)
+        proj2 = proj2.copy()
+        if np.any(inside_mask2):
+            mean_inside2 = np.mean(proj2[inside_mask2])
+            proj2[inside_mask2] = proj2[inside_mask2] - mean_inside2
+        if np.any(outside_mask2):
+            mean_outside2 = np.mean(proj2[outside_mask2])
+            proj2[outside_mask2] = proj2[outside_mask2] - mean_outside2
+            
+        # Save processed projections and masks as images for debugging/visualization
+        import os
+        import matplotlib.pyplot as plt
+        save_dir = "outputs/tmp_figs"
+        os.makedirs(save_dir, exist_ok=True)
+        # Save processed projections
+        plt.figure(figsize=(8, 8))
+        im1 = plt.imshow(proj1, cmap='gray')
+        plt.title('Projection 1 (both means removed)')
+        plt.axis('off')
+        plt.colorbar(im1, fraction=0.046, pad=0.04)
+        plt.savefig(f"{save_dir}/projection1_means_removed.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        plt.figure(figsize=(8, 8))
+        im2 = plt.imshow(proj2, cmap='gray')
+        plt.title('Projection 2 (both means removed)')
+        plt.axis('off')
+        plt.colorbar(im2, fraction=0.046, pad=0.04)
+        plt.savefig(f"{save_dir}/projection2_means_removed.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        # Save masks
+        plt.figure(figsize=(8, 8))
+        im3 = plt.imshow(inside_mask1.astype(float), cmap='gray')
+        plt.title('Mask 1 (Chan-Vese)')
+        plt.axis('off')
+        plt.colorbar(im3, fraction=0.046, pad=0.04)
+        plt.savefig(f"{save_dir}/mask1.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        plt.figure(figsize=(8, 8))
+        im4 = plt.imshow(inside_mask2.astype(float), cmap='gray')
+        plt.title('Mask 2 (Chan-Vese)')
+        plt.axis('off')
+        plt.colorbar(im4, fraction=0.046, pad=0.04)
+        plt.savefig(f"{save_dir}/mask2.png", dpi=150, bbox_inches='tight')
+        plt.close()
+
+        # Flatten the projections
+        proj1_flat = proj1.flatten()
+        proj2_flat = proj2.flatten()
+
+
+        # Compute normalized inner product (cosine similarity)
+        numerator = np.dot(proj1_flat, proj2_flat)
+        denom = (np.sqrt(np.dot(proj1_flat, proj1_flat)) * np.sqrt(np.dot(proj2_flat, proj2_flat)))
+        corr = numerator / denom
+
+        if return_rotations:
+            return corr, rotation1, rotation2
+        else:
+            return corr
     
 
 if __name__ == "__main__":
-    from aspire.downloader import emdb_2660
+
     from src.utils.distribution_generation_functions import generate_weighted_random_s2_points, create_in_plane_invariant_distribution
+    from src.utils.volume_generation_functions import white_noise_on_unit_ball
+    from aspire.volume import Volume
     from config.config import settings
 
-    # Get a sample volume
+    # Load volume and ensure mean zero
+    from aspire.downloader import emdb_2660
     vol_ds = emdb_2660().downsample(settings.data_generation.downsample_size)
     L = vol_ds.resolution
 
-    # Generate random S2 points with non-uniform weights using the new function
-    s2_coords, s2_weights = generate_weighted_random_s2_points(num_points=settings.data_generation.s2_delta_mixture.num_s2_points)
-    print(f"Generated {len(s2_coords)} random S2 points with non-uniform weights:")
-    print(f"S2 coordinates (phi, theta):\n{s2_coords}")
-    print(f"S2 weights: {s2_weights}")
-    print(f"Weights sum: {np.sum(s2_weights):.6f}")
+    # Use VMF mixture for the distribution
+    from src.utils.von_mises_fisher_distributions import (
+        generate_random_von_mises_fisher_parameters,
+        so3_distribution_from_von_mises_mixture
+    )
+    # Get VMF parameters from config
+    vmf_cfg = settings.data_generation.von_mises_fisher
+    num_vmf = vmf_cfg.num_distributions
+    kappa_range = tuple(vmf_cfg.kappa_range)
+    fibonacci_n = vmf_cfg.fibonacci_spiral_n
+    num_in_plane = vmf_cfg.num_in_plane_rotations
 
-    # Create in-plane invariant distribution with in-plane rotations using the weighted S2 points
-    rotations, rotation_weights = create_in_plane_invariant_distribution(
-        s2_coords, s2_weights, num_in_plane_rotations=settings.data_generation.s2_delta_mixture.num_in_plane_rotations, is_s2_uniform=False
+    # Generate S2 quadrature points
+    from src.utils.distribution_generation_functions import fibonacci_sphere_points
+    quadrature_points = fibonacci_sphere_points(n=fibonacci_n)
+
+    # Generate VMF mixture parameters
+    mu_directions, kappa_values, mixture_weights = generate_random_von_mises_fisher_parameters(
+        num_vmf, kappa_range=kappa_range
+    )
+
+    # Create SO(3) distribution and S2 weights from VMF mixture
+    rotations, rotation_weights = so3_distribution_from_von_mises_mixture(
+        quadrature_points, mu_directions, kappa_values, mixture_weights, num_in_plane
     )
     vdm = VolumeDistributionModel(vol_ds, rotations, rotation_weights, distribution_metadata={
-        'type': 's2_delta_mixture',
-        's2_points': s2_coords,
-        's2_weights': s2_weights
+        'type': 'vmf_mixture',
+        'means': mu_directions,
+        'kappas': kappa_values,
+        'weights': mixture_weights
     })
 
-    # Generate a single noisy projection
-    projection, rotation = vdm.generate_noisy_projections(num_projections=1, sigma=settings.data_generation.noisy.sigma)
-    print(f"Generated a single projection with shape {projection[0].shape}")
-
-    # Calculate analytical moments using the quadrature
-    A_1 = vdm.first_analytical_moment()
-    print("Analytical first moment shape:", A_1.shape)
-
-    A_2 = vdm.second_analytical_moment()
-    print("Analytical second moment shape:", A_2.shape)
+    # Print the correlation and geodesic distance for multiple pairs of random projections
+    from src.utils.rotation_utils import geodesic_distance_SO3
+    num_trials = 1  # Number of random pairs to sample per run
+    for i in range(num_trials):
+        corr, rot1, rot2 = vdm.projections_correlation(return_rotations=True)
+        print(f"[{i+1}/{num_trials}] Correlation between two random projections: {corr:.6f}")
+        dist = geodesic_distance_SO3(rot1, rot2)
+        print(f"[{i+1}/{num_trials}] Geodesic distance between the two rotations: {dist:.6f} radians\n")
