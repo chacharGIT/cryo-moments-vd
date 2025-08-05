@@ -28,9 +28,13 @@ The framework addresses the cryo-EM inverse problem by representing molecular or
 
 ## Installation
 
+**Requirements**: Python 3.12 and PyTorch 2.5.1 are specifically required for this framework.
+
 ```bash
 pip install -r requirements.txt
 ```
+
+Note: Ensure you have Python 3.12 installed before running the installation command.
 
 ## Configuration
 
