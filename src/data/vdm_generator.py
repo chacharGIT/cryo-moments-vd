@@ -116,9 +116,9 @@ def _generate_vmf_mixture_vdm(volume: Volume) -> VolumeDistributionModel:
     print("\n4. Creating Volume Distribution Model...")
     distribution_metadata = {
         'type': 'vmf_mixture',
-        'mu_directions': mu_directions,
-        'kappa_values': kappa_values,
-        'mixture_weights': mixture_weights
+        'means': mu_directions,
+        'kappas': kappa_values,
+        'weights': mixture_weights
     }
     
     vdm = VolumeDistributionModel(
@@ -195,7 +195,7 @@ def _generate_s2_delta_mixture_vdm(volume: Volume) -> VolumeDistributionModel:
     distribution_metadata = {
         'type': 's2_delta_mixture',
         's2_points': s2_points_3d,
-        's2_weights': s2_weights if s2_weights is not None else np.ones(num_s2_points) / num_s2_points
+        'weights': s2_weights if s2_weights is not None else np.ones(num_s2_points) / num_s2_points
     }
     
     vdm = VolumeDistributionModel(

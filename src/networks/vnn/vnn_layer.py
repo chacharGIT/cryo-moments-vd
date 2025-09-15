@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from src.networks.torch_utils import apply_all_C_powers
+from src.networks.vnn.torch_utils import apply_all_C_powers
 
 class VNNLayer(nn.Module):
     def __init__(self, degree: int, in_channels, out_channels):

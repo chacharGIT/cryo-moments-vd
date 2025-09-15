@@ -277,22 +277,23 @@ if __name__ == "__main__":
     import os
     from src.data.vdm_generator import generate_vdm_from_volume
     from config.config import settings
+    from src.networks.vnn.torch_utils import apply_all_C_powers
     
     # Configuration from settings
     downsample_size = settings.data_generation.downsample_size
     second_moment_batch_size = settings.data_generation.second_moment_batch_size
     device_str = f"cuda:{settings.device.cuda_device}" if settings.device.use_cuda else "cpu"
     
-    print("=== Spectral Analysis Workflow - Delta Mixture ===")
+    print("=== Spectral Analysis Workflow - vMF Mixture ===")
     print(f"Downsample size: {downsample_size}")
     print(f"Device: {device_str}")
-    save_dir = "outputs/spectral_analysis/delta_mixture_emdb_8012/"
+    save_dir = "outputs/spectral_analysis/vmf_mixture_emdb_2984/"
     
     # Generate VDM using the generator
     print("\n1. Loading volume and generating VDM...")
-    from aspire.downloader import emdb_8012
-    volume = emdb_8012()
-    vdm = generate_vdm_from_volume(volume, 's2_delta_mixture', downsample_size=downsample_size)
+    from aspire.downloader import emdb_2984
+    volume = emdb_2984()
+    vdm = generate_vdm_from_volume(volume, 'vmf_mixture', downsample_size=downsample_size)
     
     # Compute moments
     print("\n2. Computing analytical moments...")
@@ -331,14 +332,14 @@ if __name__ == "__main__":
     
     # Get distribution metadata for titles and logging
     metadata = vdm.distribution_metadata
-    num_s2_points = len(metadata['s2_points']) if 's2_points' in metadata else 0
+    num_components = len(metadata['means']) if 'means' in metadata else 0
     
     # Visualize principal eigenvectors
     visualize_eigenvectors(
         eigenvectors, eigenvalues,
         save_dir,
-        num_show=9,
-        title=f"Principal Eigenvectors - {num_s2_points} Delta Points"
+        num_show=18,
+        title=f"Principal Eigenvectors - {num_components} vMF Components"
     )
     
     # Save first moment as image
@@ -362,20 +363,56 @@ if __name__ == "__main__":
         save_diff_image_path=os.path.join(save_dir, "first_moment_vs_leading_eigenvector_difference.png")
     )
     
-    # Generate random white noise image for reference comparison
-    random_noise = np.random.randn(L, L)
-    l2_distance_noise_vs_first = compare_images_with_optimal_normalization(
-        first_moment, random_noise,
-        save_diff_image_path=os.path.join(save_dir, "first_moment_vs_noise_difference.png")
-    )
-    l2_distance_noise_vs_eigen = compare_images_with_optimal_normalization(
-        leading_eigenvector, random_noise
-    )
+    # Apply second moment operator iteratively to leading eigenvector using torch_utils
+    k_iterations = 50  # Number of iterations to apply
+    
+    print(f"   Applying second moment operator iteratively to first moment ({k_iterations} times)...")
+    
+    # Prepare inputs for apply_all_C_powers
+    # eigenvalues: (1, L²) - add batch dimension
+    eigenvalues_batch = torch.from_numpy(eigenvalues).unsqueeze(0).to(device=device_str, dtype=torch.float32)
+    
+    # eigenvectors: (1, L², L²) - add batch dimension  
+    eigenvectors_batch = torch.from_numpy(eigenvectors).unsqueeze(0).to(device=device_str, dtype=torch.float32)
+    
+    # first_moment as input: (1, L², 1) - flatten image, add batch and feature dimensions
+    x_input = torch.from_numpy(first_moment.flatten()).unsqueeze(0).unsqueeze(-1).to(device=device_str, dtype=torch.float32)
+    
+    # Compute all powers at once: C^0 x, C^1 x, ..., C^k x
+    all_powers = apply_all_C_powers(eigenvalues_batch, eigenvectors_batch, x_input, k_iterations)
+    # Shape: (k_iterations+1, 1, L², 1)
+    
+    # Compare each iteration with both the original first moment and leading eigenvector
+    leading_eigenvalue = eigenvalues[0]  # Get the leading eigenvalue for normalization
+    iteration_distances_first_moment = []
+    iteration_distances_leading_eigenvector = []
+    
+    for k in range(1, k_iterations + 1):
+        # Get the k-th power result and reshape to image
+        new_image = all_powers[k, 0, :, 0].cpu().numpy().reshape(L, L)
+        
+        # Divide by the leading eigenvalue raised to the k-th power
+        normalized_image = new_image / (leading_eigenvalue ** k)
+        
+        # Compare with original first moment
+        distance_first_moment = compare_images_with_optimal_normalization(
+            first_moment, normalized_image,
+            save_diff_image_path=None
+        )
+        iteration_distances_first_moment.append(distance_first_moment)
+        
+        # Compare with leading eigenvector
+        distance_leading_eigenvector = compare_images_with_optimal_normalization(
+            leading_eigenvector, normalized_image,
+            save_diff_image_path=None
+        )
+        iteration_distances_leading_eigenvector.append(distance_leading_eigenvector)
     
     print(f"   L2 distance (first moment vs leading eigenvector): {l2_distance:.4e}")
-    print(f"   L2 distance (first moment vs random noise): {l2_distance_noise_vs_first:.4e}")
-    print(f"   L2 distance (leading eigenvector vs random noise): {l2_distance_noise_vs_eigen:.4e}")
-    print(f"   Signal-to-noise ratio: {l2_distance_noise_vs_first / l2_distance:.2f}")
+    print(f"   First moment iteration distances: {iteration_distances_first_moment}")
+    print(f"   Leading eigenvector iteration distances: {iteration_distances_leading_eigenvector}")
+    print(f"   Distance growth ratio vs first moment (iter {k_iterations}/iter 1): {iteration_distances_first_moment[-1] / iteration_distances_first_moment[0]:.2f}")
+    print(f"   Distance growth ratio vs leading eigenvector (iter {k_iterations}/iter 1): {iteration_distances_leading_eigenvector[-1] / iteration_distances_leading_eigenvector[0]:.2f}")
     
     print(f"\n6. Analysis complete!")
     print(f"   All outputs saved to: {save_dir}")
@@ -384,13 +421,12 @@ if __name__ == "__main__":
     print(f"   - eigenvector_visualization/: Subfolder with eigenvector visualizations (multiple files)")
     print(f"   - first_moment.png: First analytical moment")
     print(f"   - first_moment_vs_leading_eigenvector_difference.png: Difference image after optimal alignment")
-    print(f"   - first_moment_vs_noise_difference.png: Difference image vs random noise (baseline)")
     
     # Print summary statistics
     print(f"\n=== Summary Statistics ===")
     print(f"Volume resolution: {downsample_size}³")
     print(f"Total matrix size: {downsample_size**2}² = {(downsample_size**2)**2:,}")
-    print(f"Delta mixture: {num_s2_points} points")
+    print(f"vMF mixture: {num_components} components")
     print(f"SO(3) quadrature: {len(vdm.rotations):,} rotations")
     print(f"Spectral properties:")
     print(f"  - Rank (eff. dim.): {np.sum(eigenvalues > eigenvalues[0] * 1e-12)}")

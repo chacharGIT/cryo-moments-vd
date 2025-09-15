@@ -1,7 +1,102 @@
 import numpy as np
-from scipy.special import ive
 from config.config import settings
 from src.utils.distribution_generation_functions import cartesian_to_spherical, create_in_plane_invariant_distribution
+
+# --- PyTorch GPU-native vMF functions ---
+import torch
+
+def von_mises_fisher_normalization_constant_torch(kappa, kappa_clamp_max=None):
+    """
+    PyTorch version: Calculate normalization constant for vMF on S^2.
+    kappa: tensor (...,)
+    Returns: tensor (...,)
+    """
+    if kappa_clamp_max is None:
+        kappa_clamp_max = float(settings.data_generation.von_mises_fisher.kappa_clamp_max)
+    kappa = torch.clamp(kappa, 0, kappa_clamp_max)
+    # Avoid division by zero for kappa=0
+    four_pi = 4 * torch.pi
+    sinh_kappa = torch.sinh(kappa)
+    # For kappa=0, sinh(0)=0, so set normalization to 1/(4pi)
+    norm = torch.where(kappa == 0, 1.0 / four_pi, kappa / (four_pi * sinh_kappa))
+    return norm
+
+def von_mises_fisher_pdf_torch(x, mu, kappa, kappa_clamp_max=None):
+    """
+    PyTorch version: Evaluate vMF PDF on S^2.
+    x: (..., 3)
+    mu: (..., 3) or (n_distributions, 3)
+    kappa: (...,) or (n_distributions,)
+    Returns: (..., n_distributions) or (...,) if single distribution
+    """
+    if kappa_clamp_max is None:
+        kappa_clamp_max = float(settings.data_generation.von_mises_fisher.kappa_clamp_max)
+    x = torch.as_tensor(x)
+    mu = torch.as_tensor(mu)
+    kappa = torch.as_tensor(kappa)
+    # Ensure 2D
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    if mu.ndim == 1:
+        mu = mu.unsqueeze(0)
+    # (n_points, 3) @ (3, n_distributions) -> (n_points, n_distributions)
+    dot_products = torch.matmul(x, mu.T)
+    kappa = torch.clamp(kappa, 0, kappa_clamp_max)
+    # Broadcast kappa if needed
+    if kappa.ndim == 0:
+        kappa = kappa.unsqueeze(0)
+    exp_arg = kappa * dot_products
+    exp_arg_max = torch.amax(exp_arg, dim=0, keepdim=True)
+    exp_stable = torch.exp(exp_arg - exp_arg_max)
+    C = von_mises_fisher_normalization_constant_torch(kappa, kappa_clamp_max)
+    pdf_values = C * exp_stable * torch.exp(exp_arg_max)
+    # Check for NaNs or infs
+    if not torch.all(torch.isfinite(pdf_values)):
+        raise RuntimeError("NaN or Inf encountered in von_mises_fisher_pdf_torch. Check kappa and input values.")
+    return pdf_values.squeeze()
+
+def generate_random_von_mises_fisher_parameters_torch(num_distributions, kappa_start, kappa_mean, device=None, dtype=None):
+    """
+    PyTorch version: Generate random vMF parameters and mixture weights.
+    Returns: mu_directions (num_distributions,3), kappa_values (num_distributions,), mixture_weights (num_distributions,)
+    """
+    if device is None:
+        device = torch.device('cpu')
+    if dtype is None:
+        dtype = torch.float32
+    # Random mean directions
+    mu = torch.randn(num_distributions, 3, device=device, dtype=dtype)
+    mu = mu / mu.norm(dim=1, keepdim=True)
+    # Translated exponential for kappa
+    scale = kappa_mean - kappa_start
+    kappa = kappa_start + torch.distributions.Exponential(1.0/scale).sample((num_distributions,)).to(device=device, dtype=dtype)
+    # Mixture weights
+    weights = torch.rand(num_distributions, device=device, dtype=dtype)
+    weights = weights / weights.sum()
+    return mu, kappa, weights
+
+def evaluate_von_mises_fisher_mixture_torch(quadrature_points, mu_directions, kappa_values, mixture_weights, kappa_clamp_max=None):
+    """
+    PyTorch version: Evaluate vMF mixture at quadrature points.
+    quadrature_points: (n_points, 3)
+    mu_directions: (n_distributions, 3)
+    kappa_values: (n_distributions,)
+    mixture_weights: (n_distributions,)
+    Returns: (n_points,)
+    """
+    quadrature_points = torch.as_tensor(quadrature_points)
+    mu_directions = torch.as_tensor(mu_directions)
+    kappa_values = torch.as_tensor(kappa_values)
+    mixture_weights = torch.as_tensor(mixture_weights)
+    pdf_values = von_mises_fisher_pdf_torch(quadrature_points, mu_directions, kappa_values, kappa_clamp_max)
+    # pdf_values: (n_points, n_distributions)
+    if pdf_values.ndim == 1 and mixture_weights.numel() > 1:
+        pdf_values = pdf_values.unsqueeze(1)
+    if pdf_values.ndim == 1:
+        mixture_pdf = mixture_weights[0] * pdf_values
+    else:
+        mixture_pdf = torch.matmul(pdf_values, mixture_weights)
+    return mixture_pdf
 
 def von_mises_fisher_normalization_constant(kappa):
     """
@@ -17,22 +112,12 @@ def von_mises_fisher_normalization_constant(kappa):
     C : float or ndarray
         Normalization constant(s)
     """
-    # For S2 (d=3), the normalization constant is  kappa / (4*pi * sinh(kappa))
+    # For S2, the normalization constant is  kappa / (4*pi * sinh(kappa))
     
     kappa = np.asarray(kappa)
-    
-    # Handle kappa = 0 case (uniform distribution)
-    result = np.zeros_like(kappa, dtype=float)
-    nonzero_mask = kappa != 0
-    
-    if np.any(nonzero_mask):
-        kappa_nz = kappa[nonzero_mask]
-        # Use sinh for numerical stability
-        result[nonzero_mask] = kappa_nz / (4 * np.pi * np.sinh(kappa_nz))
-    
-    # For kappa = 0, the normalization constant is 1/(4*pi) (uniform on S2)
-    result[~nonzero_mask] = 1.0 / (4 * np.pi)
-    
+    # Clamp kappa to avoid overflow in sinh
+    kappa = np.clip(kappa, 0, settings.data_generation.von_mises_fisher.kappa_clamp_max)
+    result = kappa / (4 * np.pi * np.sinh(kappa))
     return result if result.shape else float(result)
 
 
@@ -59,40 +144,50 @@ def von_mises_fisher_pdf(x, mu, kappa):
     mu = np.asarray(mu)
     kappa = np.asarray(kappa)
     
-    # Ensure x is 2D
+    # Ensure x,mu are 2D
     if x.ndim == 1:
         x = x.reshape(1, -1)
-    
-    # Ensure mu is 2D
     if mu.ndim == 1:
         mu = mu.reshape(1, -1)
     
-    # Calculate dot products: x · mu
     dot_products = np.dot(x, mu.T)  # Shape: (n_points, n_distributions)
-    
+
+    # Clamp kappa to avoid overflow in exp, using config
+    kappa = np.clip(kappa, 0, settings.data_generation.von_mises_fisher.kappa_clamp_max)
     # Get normalization constants
     C = von_mises_fisher_normalization_constant(kappa)
-    
-    # Calculate PDF values
+
+    # Use numerically stable exponentials
+    # Subtract max for stability
+    exp_arg = kappa * dot_products
+    exp_arg_max = np.max(exp_arg, axis=0, keepdims=True)
+    exp_stable = np.exp(exp_arg - exp_arg_max)
     if np.isscalar(kappa):
-        pdf_values = C * np.exp(kappa * dot_products.flatten())
+        pdf_values = C * exp_stable.flatten() * np.exp(exp_arg_max.flatten())
     else:
-        pdf_values = C * np.exp(kappa * dot_products)
-    
+        pdf_values = C * exp_stable * np.exp(exp_arg_max)
+
+    # Check for NaNs or infs
+    if np.any(~np.isfinite(pdf_values)):
+        raise RuntimeError("NaN or Inf encountered in von_mises_fisher_pdf. Check kappa and input values.")
+
     return pdf_values
 
 
-def generate_random_von_mises_fisher_parameters(num_distributions, kappa_range):
+def generate_random_von_mises_fisher_parameters(num_distributions, kappa_start, kappa_mean):
     """
     Generate random parameters for von-Mises Fisher distributions including mixture weights.
-    
+    kappa is sampled from a translated exponential distribution:
+        kappa = kappa_start + Exp(kappa_mean - kappa_start)
+    so that the mean of kappa is exactly kappa_mean.
     Parameters:
     -----------
     num_distributions : int
         Number of von-Mises Fisher distributions to generate parameters for
-    kappa_range : tuple
-        Range for concentration parameters (min_kappa, max_kappa)
-    
+    kappa_start : float
+        Starting value for kappa (translation of exponential)
+    kappa_mean : float
+        Desired mean of the sampled kappa values
     Returns:
     --------
     mu_directions : ndarray
@@ -105,15 +200,13 @@ def generate_random_von_mises_fisher_parameters(num_distributions, kappa_range):
     # Generate random mean directions by sampling from 3D Gaussian and normalizing
     mu_directions = np.random.randn(num_distributions, 3)
     mu_directions = mu_directions / np.linalg.norm(mu_directions, axis=1, keepdims=True)
-    
-    # Generate random concentration parameters
-    kappa_min, kappa_max = kappa_range
-    kappa_values = np.random.uniform(kappa_min, kappa_max, num_distributions)
-    
+    # Sample kappa from translated exponential so that mean is kappa_mean
+    # kappa = kappa_start + Exp(kappa_mean - kappa_start)
+    scale = kappa_mean - kappa_start
+    kappa_values = kappa_start + np.random.exponential(scale=scale, size=num_distributions)
     # Generate random mixture weights that sum to 1
     mixture_weights = np.random.uniform(0, 1, num_distributions)
     mixture_weights = mixture_weights / np.sum(mixture_weights)
-    
     return mu_directions, kappa_values, mixture_weights
 
 
@@ -189,7 +282,8 @@ if __name__ == "__main__":
     # Generate von-Mises Fisher parameters
     num_vmf = settings.data_generation.von_mises_fisher.num_distributions
     mu_directions, kappa_values, mixture_weights = generate_random_von_mises_fisher_parameters(
-        num_vmf, kappa_range=tuple(settings.data_generation.von_mises_fisher.kappa_range)
+        num_vmf, kappa_start=settings.data_generation.von_mises_fisher.kappa_start, 
+        kappa_mean=settings.data_generation.von_mises_fisher.kappa_mean
     )
     
     # Create SO(3) distribution and S2 weights from von Mises mixture

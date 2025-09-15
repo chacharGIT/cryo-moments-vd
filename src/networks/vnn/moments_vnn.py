@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.networks.vnn_layer import VNNLayer
 from config.config import settings
-
-
+from src.networks.vnn.vnn_layer import VNNLayer
 
 class VNN(nn.Module):
     def __init__(self, degree=2, hidden_dim=64, distribution_type=None, distribution_metadata=None,

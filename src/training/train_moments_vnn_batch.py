@@ -3,7 +3,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import os
 from config.config import settings
-from src.networks.moments_vnn import VNN, general_distribution_loss, l2_distribution_loss
+from src.networks.vnn.moments_vnn import VNN, general_distribution_loss, l2_distribution_loss
 from src.data.load_training_data import load_data_from_zarr, MomentsDataset
 
 def train_model(model, M1_list, M2_list, target_list, distribution_type, num_epochs, lr, device):

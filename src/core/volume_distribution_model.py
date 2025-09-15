@@ -33,7 +33,7 @@ class VolumeDistributionModel:
             {
                 "type": "s2_delta_mixture",
                 "s2_points": ndarray of shape (K, 3),
-                "s2_weights": ndarray of shape (K,)
+                "weights": ndarray of shape (K,)
             }
 
         - For "vmf_mixture":

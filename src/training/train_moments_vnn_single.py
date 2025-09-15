@@ -4,7 +4,7 @@ import torch.optim as optim
 import numpy as np
 import pyarrow.parquet as pq
 import os
-from src.networks.moments_vnn import VNN, general_distribution_loss
+from src.networks.vnn.moments_vnn import VNN, general_distribution_loss, l2_distribution_loss
 from config.config import settings
 
 
@@ -38,30 +38,40 @@ def load_data_from_parquet(parquet_path):
     # Determine distribution type and load metadata accordingly
     distribution_type = data['distribution_type'].iloc[0]
     if distribution_type == 's2_delta_mixture':
-        s2_weights = np.array(data['s2_weights'].iloc[0])
-        s2_points = np.array(data['s2_points'].iloc[0])
+        weights = data['weights'].iloc[0]
+        s2_points = data['s2_points'].iloc[0]
+        
+        # Convert to tensors directly from the extracted data
+        weights = torch.tensor(weights, dtype=torch.float32)
+        s2_points = torch.tensor(s2_points, dtype=torch.float32)
+        
         distribution_metadata = {
             'type': 's2_delta_mixture',
-            's2_weights': s2_weights,
-            's2_points': s2_points
+            'weights': weights.numpy(),
+            's2_points': s2_points.numpy()
         }
-        target = {'s2_weights': torch.tensor(s2_weights, dtype=torch.float32)}
+        target = {'weights': weights,
+                  's2_points': s2_points}
     elif distribution_type == 'vmf_mixture':
-        means = np.array(data['von_mises_mu_directions'].iloc[0])
-        means = np.stack(means).astype(np.float32)
-        kappas = np.array(data['von_mises_kappa_values'].iloc[0])
-        kappas = np.stack(kappas).astype(np.float32)
-        weights = np.array(data['von_mises_mixture_weights'].iloc[0])
-        weights = np.stack(weights).astype(np.float32)
+        means = data['means'].iloc[0]
+        kappas = data['kappas'].iloc[0]
+        weights = data['weights'].iloc[0]
+
+        print(means, kappas, weights)
+        # Convert to tensors, handling means as array of arrays
+        means = torch.tensor(np.stack(means), dtype=torch.float32)
+        kappas = torch.tensor(kappas, dtype=torch.float32)
+        weights = torch.tensor(weights, dtype=torch.float32)
+        
         distribution_metadata = {
             'type': 'vmf_mixture',
-            'means': means,
-            'kappas': kappas,
-            'von_mises_mixture_weights': weights
+            'means': means.numpy(),
+            'kappas': kappas.numpy(),
+            'weights': weights.numpy()
         }
-        target = {'means': torch.tensor(means),
-                  'kappas': torch.tensor(kappas),
-                  'weights': torch.tensor(weights)}
+        target = {'means': means,
+                  'kappas': kappas,
+                  'weights': weights}
     else:
         raise ValueError(f"Unrecognized or missing distribution_type in parquet file: {distribution_type}")
 
@@ -112,12 +122,12 @@ def train_model(model, M1, M2, target, distribution_type, num_epochs, lr, device
         optimizer.zero_grad()
         # Forward pass
         pred = model(M2_batch, M1_batch)
-        # Compute loss
-        loss = general_distribution_loss(pred, target_batch, distribution_type)
+        # Compute loss using L2 loss function
+        loss = l2_distribution_loss(pred, target_batch, distribution_type)
         loss.backward()
         optimizer.step()
         if epoch % settings.logging.print_interval == 0:
-            print(f"Epoch {epoch:4d}, Loss: {loss.item()}")
+            print(f"Epoch {epoch:4d}, Loss: {loss.item():.6f}")
             if settings.logging.verbose:
                 with torch.no_grad():
                     for k in pred:
@@ -140,6 +150,7 @@ if __name__ == "__main__":
     print(f"Distribution type: {distribution_type}")
     model = VNN(degree=settings.model.architecture.vnn_layer_degree,
                 hidden_dim=settings.model.architecture.hidden_dim,
+                distribution_type=distribution_type,
                 distribution_metadata=distribution_metadata).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
     # Load model if exists
@@ -164,8 +175,11 @@ if __name__ == "__main__":
         M1_flat = M1.flatten().unsqueeze(0).unsqueeze(-1).to(device)
         M2_reshaped = M2.view(L*L, L*L).unsqueeze(0).to(device)
         pred = trained_model(M2_reshaped, M1_flat)
+        
+        # Prepare target batch for final evaluation
         target_batch = {k: v.unsqueeze(0).to(device) for k, v in target.items()}
-        final_loss = general_distribution_loss(pred, target_batch, distribution_type)
+        
+        final_loss = l2_distribution_loss(pred, target_batch, distribution_type)
         print(f"Final loss: {final_loss.item():.6f}")
         for k in pred:
             print(f"Final predicted {k}: {pred[k][0].cpu().numpy()}")
