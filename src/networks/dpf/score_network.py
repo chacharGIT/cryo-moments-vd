@@ -18,11 +18,11 @@ class S2ScoreNetwork(nn.Module):
 
         # Fourier encoding: 2 values (sin, cos) per frequency
         fourier_dim = time_enc_len * 2
-        # Spherical harmonics: (L+1)^2 real harmonics
-        sph_dim = (sph_enc_len + 1) ** 2
+        # Spherical harmonics: (L+1)^2-1 real harmonics - Exclude l=0 (constant) term
+        sph_dim = (sph_enc_len + 1) ** 2 - 1
 
         context_dim = fourier_dim + sph_dim + d  # Full context encoding
-        query_dim = sph_dim  # Only positional encoding for queries
+        query_dim = context_dim
         output_dim = d  # Output dimension (score per point)
 
         # Prepare PerceiverIO config, override dims to match input construction

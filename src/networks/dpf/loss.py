@@ -5,7 +5,7 @@ def dpf_score_matching_loss(
     pred_score, true_score,
     scale_invariant=False,
     variance_matching=False, lambda_var=0.03,
-    correlation_matching=False, lambda_corr=0.03,
+    correlation_matching=False, lambda_corr=0.01,
     third_cumulant_matching=False, lambda_cum3=0.01
 ):
     """

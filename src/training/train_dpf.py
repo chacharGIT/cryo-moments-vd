@@ -1,15 +1,13 @@
 import torch
+from tqdm import tqdm
 import os
 import zarr
 from config.config import settings
 from src.networks.dpf.sample_generation import build_network_input
-from src.data.vmf_mixture_dataset import ZarrVMFMixtureDataset
-from torch.utils.data import DataLoader, random_split
 from src.utils.distribution_generation_functions import fibonacci_sphere_points
 from src.networks.dpf.score_network import S2ScoreNetwork
 from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_schedule
 from src.networks.dpf.loss import dpf_score_matching_loss
-
 
 def train():
     if settings.device.use_cuda and torch.cuda.is_available():
@@ -29,9 +27,9 @@ def train():
         ckpt_path = os.path.expanduser(ckpt_path)
         if os.path.isfile(ckpt_path):
             checkpoint = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"Loaded model parameters from {ckpt_path}")
+            print(f"Loaded model parameters from {ckpt_path} (strict=False)")
         else:
             print(f"Model parameters file not found at {ckpt_path}")
 
@@ -56,24 +54,22 @@ def train():
         num_batches = 0
         # Shuffle train indices each epoch if desired (optional)
         perm = train_indices[torch.randperm(train_size)]
-        for batch_idx in range(0, train_size, batch_size):
+        for batch_idx in tqdm(range(0, train_size, batch_size), desc=f"Epoch {epoch+1}", leave=False):
             idx = perm[batch_idx:batch_idx+batch_size]
             batch_func = func_data[idx]
             batch_kappa = kappa[idx]
             batch_mu = mu[idx]
             batch_weights = weights[idx]
             batch_func = batch_func / (batch_func.std(dim=1, keepdim=True))
-            t = torch.rand(batch_size, device=batch_func.device)
+            current_batch_size = batch_func.shape[0]
+            t = torch.rand(current_batch_size, device=batch_func.device)
             x_t = q_sample(batch_func, t) # [batch, n_points]
             context_encoding = build_network_input(
                 points, t, x_t,
                 time_enc_len=settings.dpf.time_encoding_len,
                 sph_enc_len=settings.dpf.pos_encoding_max_harmonic_degree
             )
-            # Query: positional encoding only (slice from context_encoding)
-            fourier_dim = settings.dpf.time_encoding_len * 2
-            sph_dim = (settings.dpf.pos_encoding_max_harmonic_degree + 1) ** 2
-            query_encoding = context_encoding[..., fourier_dim:fourier_dim + sph_dim]
+            query_encoding = context_encoding
             # Ensure model inputs are float32
             context_encoding = context_encoding.to(dtype=torch.float32)
             query_encoding = query_encoding.to(dtype=torch.float32)
@@ -84,8 +80,8 @@ def train():
             # Squeeze pred_score if it has an extra singleton dimension
             if pred_score.dim() == true_score.dim() + 1 and pred_score.shape[-1] == 1:
                 pred_score = pred_score.squeeze(-1)
-            loss = dpf_score_matching_loss(pred_score, true_score, scale_invariant=True, variance_matching=True,
-                                           correlation_matching=True, third_cumulant_matching=True)
+            loss = dpf_score_matching_loss(pred_score, true_score, scale_invariant=True, variance_matching=False,
+                                           correlation_matching=False, third_cumulant_matching=False)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -100,6 +96,7 @@ def train():
         diff = true_score - pred_score
         print(f"[DEBUG] score diff (last batch): min={{:.4g}}, max={{:.4g}}, mean={{:.4g}}, std={{:.4g}}".format(
             diff.min().item(), diff.max().item(), diff.mean().item(), diff.std().item()))
+        print(f"func_scale value: {model.perceiver.func_scale.item()}")
         if (epoch + 1) % settings.training.epochs_per_checkpoint == 0 or (epoch + 1) == settings.training.num_epochs:
             checkpoint_path = settings.model.checkpoint.save_path.replace('.pth', f'_epoch_{epoch+1}.pth')
             torch.save({

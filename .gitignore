@@ -3,5 +3,6 @@ __pycache__/
 .vscode/
 logs/
 outputs/
+packages/*
 config/parameters.yaml
 aspire.err.log

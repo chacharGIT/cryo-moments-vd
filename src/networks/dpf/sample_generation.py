@@ -40,7 +40,7 @@ def spherical_harmonic_encoding(points, max_degree):
         points = points.unsqueeze(0)  # [1, n_points, 3]
     points = torch.as_tensor(points, dtype=torch.float64, device=points.device)
     points = points / points.norm(dim=-1, keepdim=True)
-    sph = spherical_harmonics(list(range(max_degree + 1)), points.reshape(-1, 3), normalize=True, normalization='component')
+    sph = spherical_harmonics(list(range(1, max_degree + 1)), points.reshape(-1, 3), normalize=True, normalization='component')
     sph = sph.view(points.shape[0], points.shape[1], -1)  # [batch, n_points, num_harmonics]
     return sph
 

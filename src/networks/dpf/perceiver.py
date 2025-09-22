@@ -151,8 +151,9 @@ class PerceiverIO(nn.Module):
                  latent_dim_head,
                  seq_dropout_prob,
                  logits_dim=None,
+                 ff_mult=4,
                  weight_tie_layers=False,
-                 decoder_ff=False):
+                 ):
         super().__init__()
         # Xavier initialization for all Linear layers
         self.apply(xavier_init_linear)
@@ -160,10 +161,10 @@ class PerceiverIO(nn.Module):
         self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
         self.cross_attend_blocks = nn.ModuleList([
             PreNorm(latent_dim, Attention(latent_dim, dim, heads=cross_heads, dim_head=cross_dim_head), context_dim=dim),
-            PreNorm(latent_dim, FeedForward(latent_dim))
+            PreNorm(latent_dim, FeedForward(latent_dim, mult=ff_mult))
         ])
         get_latent_attn = lambda: PreNorm(latent_dim, Attention(latent_dim, heads=latent_heads, dim_head=latent_dim_head))
-        get_latent_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim))
+        get_latent_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim, mult=ff_mult))
         get_latent_attn, get_latent_ff = map(cache_fn, (get_latent_attn, get_latent_ff))
         self.layers = nn.ModuleList([])
         cache_args = {'_cache': weight_tie_layers}
@@ -173,10 +174,22 @@ class PerceiverIO(nn.Module):
                 get_latent_ff(**cache_args)
             ]))
         self.decoder_cross_attn = PreNorm(queries_dim, Attention(queries_dim, latent_dim, heads=cross_heads, dim_head=cross_dim_head), context_dim=latent_dim)
-        self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
+        self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim, mult=ff_mult))
         self.to_logits = nn.Linear(queries_dim, logits_dim) if exists(logits_dim) else nn.Identity()
+        # Learnable scaling for function value channels (assumed last d channels)
+        self.func_scale = nn.Parameter(torch.ones(1) * 1e3)
     def forward(self, data, mask=None, queries=None):
         b = data.shape[0]
+        # Apply learnable scaling to function value channels (last d channels)
+        # Get d from input shape
+        d = 1  # Default to 1, override if known
+        if hasattr(self, 'logits_dim'):
+            d = self.logits_dim
+        else:
+            pass
+        if d > 0:
+            func_data = data[..., -d:] * self.func_scale
+            data = torch.cat([data[..., :-d], func_data], dim=-1)
         x = repeat(self.latents, 'n d -> b n d', b=b)
         cross_attn, cross_ff = self.cross_attend_blocks
         if self.training and self.seq_dropout_prob > 0.:

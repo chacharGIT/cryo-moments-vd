@@ -11,6 +11,23 @@ def cosine_signal_scaling_schedule(t, s=0.008):
     scaling = torch.cos(((t + s) / (1 + s)) * torch.pi * 0.5) ** 2
     return scaling
 
+def beta_schedule(t, s=0.008):
+    """
+    Returns beta(t) for the continuous cosine noise schedule (Song et al., 2021).
+    Uses the closed-form expression for the derivative of the signal scaling schedule.
+    Supports batch input for t.
+    Args:
+        t: tensor of shape [batch] or [...], values in [0, 1]
+        s: float, schedule offset (default 0.008)
+    Returns:
+        beta_t: tensor of same shape as t
+    """
+    angle = (t + s) / (1 + s) * torch.pi * 0.5
+    cos_angle = torch.cos(angle)
+    sin_angle = torch.sin(angle)
+    beta_t = (torch.pi * 0.5) * sin_angle / (cos_angle ** 2)
+    return beta_t
+
 def q_sample(x_0, t):
     """
     Domain-agnostic forward diffusion (DDPM-style) for any signal x_0 at continuous timestep t in [0, 1].
