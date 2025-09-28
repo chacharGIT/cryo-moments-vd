@@ -134,7 +134,7 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{settings.device.cuda_device}" if settings.device.use_cuda and torch.cuda.is_available() else "cpu")
     model = S2ScoreNetwork().to(device)
 
-    checkpoint = torch.load("./outputs/model_parameter_files/dpf_test_5_epoch_170.pth", map_location=device)
+    checkpoint = torch.load("./outputs/model_parameter_files/dpf_test_5_epoch_850.pth", map_location=device)
     # Selection: plot single timestep or run full diffusion inference
     mode = "diffusion" # "single" or "diffusion"
     t_value = 1 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
