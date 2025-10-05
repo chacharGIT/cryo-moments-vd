@@ -4,25 +4,24 @@ import matplotlib.pyplot as plt
 import os
 from typing import Tuple, Optional, Union
 
-
 def compute_second_moment_eigendecomposition(second_moment: Union[np.ndarray, torch.Tensor], 
-                                           device: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+                                               device: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute the eigendecomposition of the second moment tensor.
-    
+
     The second moment tensor has shape (L, L, L, L) and can be viewed as a linear operator
     acting on the image space of size L×L. This function reshapes it to (L², L²) and 
     computes its eigendecomposition.
-    
-    Parameters:
-    -----------
+
+    Parameters
+    ----------
     second_moment : ndarray or torch.Tensor
         Second moment tensor of shape (L, L, L, L)
     device : str, optional
         Device to use for computation ('cuda' or 'cpu'). If None, uses GPU if available.
-        
-    Returns:
-    --------
+
+    Returns
+    -------
     eigenvalues : ndarray
         Eigenvalues in descending order, shape (L²,)
     eigenvectors : ndarray
@@ -30,25 +29,21 @@ def compute_second_moment_eigendecomposition(second_moment: Union[np.ndarray, to
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
     # Convert to torch tensor if needed
     if isinstance(second_moment, np.ndarray):
         second_moment_t = torch.from_numpy(second_moment).to(device=device, dtype=torch.float64)
     else:
         second_moment_t = second_moment.to(device=device, dtype=torch.float64)
-    
+    if second_moment_t.dim() != 4:
+        raise ValueError("second_moment must be a 4D tensor (L, L, L, L)")
     L = second_moment_t.shape[0]
-    
     # Reshape from (L, L, L, L) to (L², L²) to view as a matrix operator
     M = second_moment_t.reshape(L*L, L*L)
-    
     # Compute eigendecomposition, the matrix should be symmetric/Hermitian 
     eigenvalues, eigenvectors = torch.linalg.eigh(M)
     # Sort in descending order
     idx = torch.argsort(eigenvalues, descending=True)
-
     return eigenvalues[idx].cpu().numpy(), eigenvectors[:, idx].cpu().numpy()
-
 
 def plot_eigenvalues(eigenvalues: np.ndarray, 
                     log_scale: bool = True,
@@ -135,7 +130,6 @@ def plot_eigenvalues(eigenvalues: np.ndarray,
     
     plt.close()
 
-
 def visualize_eigenvectors(eigenvectors: np.ndarray, 
                           eigenvalues: np.ndarray,
                           save_dir: str,
@@ -220,7 +214,6 @@ def visualize_eigenvectors(eigenvectors: np.ndarray,
     
     if num_plots > 1:
         print(f"Created {num_plots} eigenvector plots in {eigenvec_dir}")
-
 
 def compare_images_with_optimal_normalization(image1: np.ndarray, image2: np.ndarray, save_diff_image_path: Optional[str] = None):
     """

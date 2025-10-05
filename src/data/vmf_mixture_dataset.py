@@ -1,8 +1,6 @@
-import array
 import torch
 from torch.utils.data import Dataset
 import zarr
-import numpy as np
 
 class ZarrVMFMixtureDataset(Dataset):
     """

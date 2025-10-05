@@ -27,7 +27,7 @@ def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_s
     # Accept float64 input for high-precision integration
     x = x_t_init.to(device=device, dtype=torch.float64)
     langevin_steps = settings.dpf.inference_langevin_steps
-    solver_steps = settings.dpf.inference_solver_timesteps
+    solver_steps = settings.dpf.inference_solver_steps
     t_start = min(t_start, 1 - 1e-3)
     # Langevin: times from t_start to inference_langevin_t_end
     langevin_t_start = t_start
@@ -134,10 +134,10 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{settings.device.cuda_device}" if settings.device.use_cuda and torch.cuda.is_available() else "cpu")
     model = S2ScoreNetwork().to(device)
 
-    checkpoint = torch.load("./outputs/model_parameter_files/dpf_test_5_epoch_850.pth", map_location=device)
+    checkpoint = torch.load("./outputs/model_parameter_files/dpf_test_5_epoch_1700.pth", map_location=device)
     # Selection: plot single timestep or run full diffusion inference
     mode = "diffusion" # "single" or "diffusion"
-    t_value = 1 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
+    t_value = 0.9 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
     use_zarr_example = False
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)

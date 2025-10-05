@@ -7,6 +7,7 @@ from aspire.volume import Volume
 from aspire.utils.rotation import Rotation
 import matplotlib.pyplot as plt
 from src.utils.distribution_generation_functions import generate_weighted_random_s2_points, create_in_plane_invariant_distribution
+from src.utils.matrix_generation_functions import generate_gaussian_matrix
 
 
 class VolumeDistributionModel:
@@ -166,12 +167,53 @@ class VolumeDistributionModel:
             batch_projs = projections_t[start_idx:end_idx]  # (B, L, L)
             batch_weights = weights_t[start_idx:end_idx]  # (B,)
             # Compute weighted outer products for this batch
-            # einsum: bij,bkl->bijkl
             outer = torch.einsum('bij,bkl->bijkl', batch_projs, batch_projs)
             weighted_outer = batch_weights[:, None, None, None, None] * outer
             second_moment += torch.sum(weighted_outer, dim=0)
         return second_moment.cpu().numpy()
-        
+    
+    def third_analytical_moment_sketch(self, sketch_size, device=None, dtype=torch.float32):
+        """
+        Calculate the third analytical moment using structured tensor sketching (see Eq. 46 in the referenced method).
+        This method avoids memory blowup by sketching the unfolded third moment tensor using two Gaussian matrices.
+
+        Parameters:
+        -----------
+        sketch_size : int
+            Number of columns in the Gaussian sketch matrices (s). It is required that s << d^2 for efficient sketching.
+        device : str or torch.device, optional
+            Device for computation.
+        dtype : torch.dtype, optional
+            Data type for sketch matrices.
+
+        Returns:
+        --------
+        sketch : torch.Tensor, shape (d, s)
+            Sketched third analytical moment.
+        """
+        # Prepare projections and weights as in first/second moment
+        L = self.volume.resolution
+        d = L * L
+        projections = self.volume.project(self.rotations).asnumpy().copy()  # (N, L, L)
+        weights = self.distribution
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        projections_t = torch.from_numpy(projections).to(device=device, dtype=dtype)
+        weights_t = torch.from_numpy(weights).to(device=device, dtype=dtype)
+        N = projections_t.shape[0]
+        # Flatten each projection to (N, d)
+        I_hat = projections_t.view(N, -1)
+        # Apply weights
+        I_hat = I_hat * weights_t[:, None]
+        # Generate sketch matrices
+        G1 = generate_gaussian_matrix((d, sketch_size), device=device, dtype=dtype)
+        G2 = generate_gaussian_matrix((d, sketch_size), device=device, dtype=dtype)
+        v1 = I_hat @ G1  # (N, s)
+        v2 = I_hat @ G2  # (N, s)
+        sketch = torch.einsum('nd,ns->nds', I_hat, v1 * v2)  # (N, d, s)
+        sketch = sketch.mean(dim=0)  # (d, s)
+        return sketch
+
     def save_projections(self, projections, filename_prefix="projection", save_dir="tmp_figs"):
         """
         Save projection images to files.

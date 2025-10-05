@@ -60,6 +60,25 @@ def generate_goe_matrix(downsample_size: int,
     return goe_matrix
 
 
+def generate_gaussian_matrix(shape, device: str = None, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """
+    Generate a standard Gaussian random matrix of given shape.
+    Entries are drawn from N(0, 1).
+    Args:
+        shape: tuple or list of ints
+            Desired output shape (e.g., (d, s)).
+        device: str or torch.device, optional
+            Device for computation ('cuda' or 'cpu').
+        dtype: torch.dtype, optional
+            Data type for the matrix.
+    Returns:
+        torch.Tensor of shape `shape` with standard normal entries.
+    """
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    return torch.randn(*shape, device=device, dtype=dtype)
+
+
 if __name__ == "__main__":
     print("=== GOE Matrix Generation Test ===")    
     # Generate test matrix
@@ -67,4 +86,3 @@ if __name__ == "__main__":
     print(f"Matrix shape: {goe_test.shape}")
     print(f"Matrix dtype: {goe_test.dtype}")
     print(f"Is symmetric: {torch.allclose(goe_test, goe_test.T)}")
-   
