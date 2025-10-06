@@ -33,9 +33,13 @@ class S2ScoreNetwork(nn.Module):
         perceiver_config['logits_dim'] = output_dim  # output a scalar per point
         self.perceiver = PerceiverIO(**perceiver_config)
 
-    def forward(self, context, queries, mask=None):
-        # context: [batch, n_points, context_dim] (full encoding)
-        # queries: [batch, n_points, query_dim] (positional encoding only)
-        # mask: optional
-        return self.perceiver(context, queries=queries, mask=mask)
+    def forward(self, context, queries, mask=None, cond_feat=None):
+        """
+        Args:
+            context: [batch, n_points, context_dim] (full encoding)
+            queries: [batch, n_points, query_dim] (positional encoding only)
+            mask: optional
+            cond_feat: [batch, latent_dim] or [batch, 1, latent_dim] or [batch, n_latents, latent_dim] (optional conditional vector)
+        """
+        return self.perceiver(context, queries=queries, mask=mask, cond_feat=cond_feat)
 

@@ -178,7 +178,7 @@ class PerceiverIO(nn.Module):
         self.to_logits = nn.Linear(queries_dim, logits_dim) if exists(logits_dim) else nn.Identity()
         # Learnable scaling for function value channels (assumed last d channels)
         self.func_scale = nn.Parameter(torch.ones(1) * 1e3)
-    def forward(self, data, mask=None, queries=None):
+    def forward(self, data, mask=None, queries=None, cond_feat=None):
         b = data.shape[0]
         # Apply learnable scaling to function value channels (last d channels)
         # Get d from input shape
@@ -191,18 +191,33 @@ class PerceiverIO(nn.Module):
             func_data = data[..., -d:] * self.func_scale
             data = torch.cat([data[..., :-d], func_data], dim=-1)
         x = repeat(self.latents, 'n d -> b n d', b=b)
+        # Additive conditioning: add cond_feat to latents if provided
+        if cond_feat is not None:
+            cond_feat_exp = cond_feat.unsqueeze(1).expand(-1, x.shape[1], -1)
+            x = x + cond_feat_exp
         cross_attn, cross_ff = self.cross_attend_blocks
         if self.training and self.seq_dropout_prob > 0.:
             data, mask = dropout_seq(data, mask, self.seq_dropout_prob)
         x = cross_attn(x, context=data, mask=mask) + x
+        if cond_feat is not None:
+            x = x + cond_feat_exp
         x = cross_ff(x) + x
+        if cond_feat is not None:
+            x = x + cond_feat_exp
         for self_attn, self_ff in self.layers:
             x = self_attn(x) + x
+            if cond_feat is not None:
+                x = x + cond_feat_exp
             x = self_ff(x) + x
+            if cond_feat is not None:
+                x = x + cond_feat_exp
         if not exists(queries):
             return x
         if queries.ndim == 2:
             queries = repeat(queries, 'n d -> b n d', b=b)
+        # Optionally inject cond_feat before decoder cross-attn
+        if cond_feat is not None:
+            x = x + cond_feat_exp
         latents = self.decoder_cross_attn(queries, context=x)
         if exists(self.decoder_ff):
             latents = latents + self.decoder_ff(latents)
