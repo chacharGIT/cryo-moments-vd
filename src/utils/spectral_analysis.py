@@ -286,17 +286,25 @@ if __name__ == "__main__":
     print("\n1. Loading volume and generating VDM...")
     from aspire.downloader import emdb_2984
     volume = emdb_2984()
-    vdm = generate_vdm_from_volume(volume, 'vmf_mixture', downsample_size=downsample_size)
-    
+    volume = volume.downsample(downsample_size)
+
+    from src.utils.distribution_generation_functions import generate_weighted_random_s2_points
+    from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution
+    from src.core.volume_distribution_model import VolumeDistributionModel
+    quadrature_points, s2_distribution = generate_weighted_random_s2_points(1)
+    so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
+                                                                            num_in_plane_rotations=1024)
+    vdm = VolumeDistributionModel(volume, rotations=so3_rotations, distribution=so3_weights)
+
+    # vdm = generate_vdm_from_volume(volume, 'vmf_mixture', downsample_size=downsample_size)
     # Compute moments
     print("\n2. Computing analytical moments...")
-    first_moment = vdm.first_analytical_moment(device=device_str)
+    first_moment = vdm.first_analytical_moment()
     print(f"   First moment computed: shape {first_moment.shape}")
     
     second_moment = vdm.second_analytical_moment(
         batch_size=second_moment_batch_size, 
         show_progress=True, 
-        device=device_str,
         dtype=torch.float64
     )
     print(f"   Second moment computed: shape {second_moment.shape}")
@@ -323,16 +331,13 @@ if __name__ == "__main__":
         save_path=os.path.join(save_dir, "eigenvalue_spectrum.png")
     )
     
-    # Get distribution metadata for titles and logging
-    metadata = vdm.distribution_metadata
-    num_components = len(metadata['means']) if 'means' in metadata else 0
     
     # Visualize principal eigenvectors
     visualize_eigenvectors(
         eigenvectors, eigenvalues,
         save_dir,
         num_show=18,
-        title=f"Principal Eigenvectors - {num_components} vMF Components"
+        title=f"Principal Eigenvectors"
     )
     
     # Save first moment as image
@@ -419,9 +424,8 @@ if __name__ == "__main__":
     print(f"\n=== Summary Statistics ===")
     print(f"Volume resolution: {downsample_size}³")
     print(f"Total matrix size: {downsample_size**2}² = {(downsample_size**2)**2:,}")
-    print(f"vMF mixture: {num_components} components")
     print(f"SO(3) quadrature: {len(vdm.rotations):,} rotations")
     print(f"Spectral properties:")
     print(f"  - Rank (eff. dim.): {np.sum(eigenvalues > eigenvalues[0] * 1e-12)}")
     print(f"  - 90% energy in top: {np.where(np.cumsum(eigenvalues)/np.sum(eigenvalues) >= 0.9)[0][0] + 1} components")
-    print(f"  - 99% energy in top: {np.where(np.cumsum(eigenvalues)/np.sum(eigenvalues) >= 0.99)[0][0] + 1} components")
+    print(f"  - 99% energy in top: {np.where(np.cumsum(eigenvalues)/np.sum(eigenvalues) >= 1 - 1e-7)[0][0] + 1} components")

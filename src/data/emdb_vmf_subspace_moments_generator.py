@@ -9,7 +9,8 @@ import zarr
 import numpy as np
 from src.data.emdb_downloader import search_emdb_asymmetric_ids, download_emdb_map, load_aspire_volume
 from src.utils.von_mises_fisher_distributions import generate_random_von_mises_fisher_parameters
-from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution
+from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution, fibonacci_sphere_points
+from src.utils.von_mises_fisher_distributions import evaluate_von_mises_fisher_mixture
 from src.core.volume_distribution_model import VolumeDistributionModel
 from src.utils.spectral_analysis import compute_second_moment_eigendecomposition
 from config.config import settings
@@ -24,6 +25,10 @@ def main():
     else:
         device = "cpu"
 
+    # Generate quadrature points once
+    n_quadrature = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
+    quadrature_points = fibonacci_sphere_points(n_quadrature)
+
     # Preallocate lists for all samples (to be periodically flushed)
     all_means = []
     all_kappas = []
@@ -32,6 +37,7 @@ def main():
     all_eigen_values = []
     all_first_moments = []
     all_volume_ids = []
+    all_distribution_evaluations = []
     total_samples = 0
 
     emdb_ids = search_emdb_asymmetric_ids(
@@ -58,6 +64,7 @@ def main():
                 settings.data_generation.von_mises_fisher.num_distributions,
                 settings.data_generation.von_mises_fisher.kappa_start,
                 settings.data_generation.von_mises_fisher.kappa_mean)
+            mixture_eval = evaluate_von_mises_fisher_mixture(quadrature_points, mu, kappa, weights)
             # Create SO(3) distribution
             rotations, distribution = create_in_plane_invariant_distribution(
                 mu, weights, num_in_plane_rotations=settings.data_generation.von_mises_fisher.num_in_plane_rotations)
@@ -69,12 +76,13 @@ def main():
                 "weights": weights
             })
             # Compute moments
-            first_moment = vdm.first_analytical_moment(device=device)
-            second_moment = vdm.second_analytical_moment(batch_size=200, device=device)
+            first_moment = vdm.first_analytical_moment()
+            second_moment = vdm.second_analytical_moment(batch_size=200)
             # Spectral decomposition (full)
             eigvals, eigvecs = compute_second_moment_eigendecomposition(second_moment, device=device)
             L = second_moment.shape[0]
             total_energy = np.trace(second_moment.reshape(L*L, L*L))
+            # Compute cumulative energy and keep only significant eigenvectors/values
             cum_energy = np.cumsum(eigvals) / total_energy
             n_keep = np.searchsorted(cum_energy, 1 - settings.data_generation.second_moment_eigen_energy_dismiss_fraction) + 1
             if i == 0:
@@ -88,12 +96,17 @@ def main():
             all_eigen_values.append(eigvals_keep)
             all_first_moments.append(first_moment)
             all_volume_ids.append(emdb_id)
+            all_distribution_evaluations.append(mixture_eval)
             total_samples += 1
 
             # Periodic save and append
             if total_samples % save_interval == 0:
                 print(f"Reached {total_samples} samples, saving to Zarr...")
-                _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, all_eigen_values, all_first_moments, all_volume_ids)
+                _flush_to_zarr(
+                    root, all_means, all_kappas, all_weights, all_eigen_images,
+                    all_eigen_values, all_first_moments, all_volume_ids,
+                    all_distribution_evaluations
+                )
                 all_means.clear()
                 all_kappas.clear()
                 all_weights.clear()
@@ -101,15 +114,16 @@ def main():
                 all_eigen_values.clear()
                 all_first_moments.clear()
                 all_volume_ids.clear()
+                all_distribution_evaluations.clear()
 
     # Final flush for any remaining samples
     if all_means:
         print(f"Final flush: saving remaining {len(all_means)} samples to Zarr...")
-        _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, all_eigen_values, all_first_moments, all_volume_ids)
+        _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, all_eigen_values, all_first_moments, all_volume_ids, all_distribution_evaluations)
         print(f"Saved {total_samples} samples from {len(emdb_ids)} volumes to {save_path}")
 
 
-def _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, all_eigen_values, all_first_moments, all_volume_ids):
+def _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, all_eigen_values, all_first_moments, all_volume_ids, all_distribution_evaluations):
     def pad_or_cut(arr, n_eigen_target):
         arr = np.asarray(arr)
         if arr.ndim == 1:
@@ -138,6 +152,7 @@ def _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, a
     kappas_arr = np.stack(all_kappas)
     weights_arr = np.stack(all_weights)
     volume_ids_arr = np.array(all_volume_ids)
+    distribution_evaluations_arr = np.stack(all_distribution_evaluations)
 
     # If datasets do not exist, create them; else, append
     def append_or_create(name, arr, axis=0):
@@ -160,6 +175,7 @@ def _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, a
     append_or_create("eigen_values", eigen_values_arr)
     append_or_create("first_moments", first_moments_arr)
     append_or_create("volume_ids", volume_ids_arr)
+    append_or_create("distribution_evaluations", distribution_evaluations_arr)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ def generate_and_save_noisy_data(vdm: VolumeDistributionModel, num_images, outpu
     
     print(f"Generating {num_images} noisy projections with sigma={sigma}...")
     # Use the new generate_noisy_projections function
-    noisy_projections, sampled_rotations = vdm.generate_noisy_projections(
+    noisy_projections, sampled_rotations = vdm.generate_projections(
         num_projections=num_images, sigma=sigma
     )
     

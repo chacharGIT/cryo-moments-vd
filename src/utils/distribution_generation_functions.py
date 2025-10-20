@@ -130,38 +130,27 @@ def generate_weighted_random_s2_points(num_points):
         Array of shape (num_points,) containing random weights that sum to 1
     """
     
-    # Generate random S2 points using the same method as generate_random_s2_points
-    cartesian_points = np.random.randn(num_points, 3)
-    cartesian_points = cartesian_points / np.linalg.norm(cartesian_points, axis=1, keepdims=True)
-    
-    # Convert to spherical coordinates
-    theta = np.arccos(np.clip(cartesian_points[:, 2], -1, 1))  # Polar angle [0, π]
-    phi = np.arctan2(cartesian_points[:, 1], cartesian_points[:, 0])  # Azimuthal angle [-π, π]
-    
-    # Ensure phi is in [0, 2π]
-    phi = np.where(phi < 0, phi + 2*np.pi, phi)
-    
-    s2_points = np.column_stack([phi, theta])
-    
+    # Generate random S2 points in Cartesian coordinates
+    s2_points = np.random.randn(num_points, 3)
+    s2_points = s2_points / np.linalg.norm(s2_points, axis=1, keepdims=True)
+
     # Generate random weights uniformly from [0,1] and normalize to sum to 1
     weights = np.random.uniform(0, 1, num_points)
     weights = weights / np.sum(weights)
-    
+
     return s2_points, weights
 
 
-def create_in_plane_invariant_distribution(s2_spherical_coords, s2_weights=None, num_in_plane_rotations=8, is_s2_uniform=False):
+def create_in_plane_invariant_distribution(s2_points, s2_weights=None, num_in_plane_rotations=8, is_s2_uniform=False):
     """
-    Create a distribution from given S2 points (in spherical coordinates) with weights 
+    Create a distribution from given S2 points (in Cartesian coordinates) with weights 
     and uniform in-plane rotations.
     
     Parameters:
     -----------
-    s2_spherical_coords : ndarray
-        Array of shape (num_s2_points, 2) containing (phi, theta) in spherical coordinates
-        phi: azimuthal angle [0, 2π]
-        theta: polar angle [0, π]
-    s2_weights : ndarray
+    s2_coords : ndarray
+        Array of shape (num_s2_points, 3) containing (x, y, z) in Cartesian coordinates
+    s2_weights : ndarray or None
         Array of shape (num_s2_points,) containing weights for each S2 point
         (ignored if is_s2_uniform=True)
     num_in_plane_rotations : int
@@ -176,21 +165,26 @@ def create_in_plane_invariant_distribution(s2_spherical_coords, s2_weights=None,
     distribution : ndarray
         Array of weights for each rotation
     """
-    num_s2_points = len(s2_spherical_coords)
+    num_s2_points = len(s2_points)
     
     # Create uniform weights if requested
     if is_s2_uniform or s2_weights is None:
         s2_weights = np.ones(num_s2_points) / num_s2_points
     
-    # Generate uniform in-plane rotation angles
-    in_plane_angles = np.linspace(0, 2*np.pi, num_in_plane_rotations, endpoint=False)
-    
-    # Create arrays to store all rotation parameters and weights using vectorized operations
-    total_rotations = num_s2_points * num_in_plane_rotations
+    # Convert S2 Cartesian points to spherical coordinates (phi, theta)
+    phi = np.arctan2(s2_points[:, 1], s2_points[:, 0])
+    phi = np.where(phi < 0, phi + 2 * np.pi, phi)
+    theta = np.arccos(np.clip(s2_points[:, 2], -1, 1))
+
+    # Generate uniform in-plane rotation angles with a random starting angle
+    psi_0 = np.random.uniform(0, 2*np.pi, num_s2_points)
+    # For each S2 point, generate evenly spaced psi angles starting from psi_0
+    in_plane_angles = psi_0[:, None] + np.arange(num_in_plane_rotations) * 2 * np.pi / num_in_plane_rotations
+    in_plane_angles = in_plane_angles % (2 * np.pi)
     
     # Use meshgrid to create all combinations efficiently
-    phi_s2, psi_in_plane = np.meshgrid(s2_spherical_coords[:, 0], in_plane_angles, indexing='ij')
-    theta_s2, _ = np.meshgrid(s2_spherical_coords[:, 1], in_plane_angles, indexing='ij')
+    phi_s2, psi_in_plane = np.meshgrid(phi, in_plane_angles, indexing='ij')
+    theta_s2 = np.repeat(theta[:, None], num_in_plane_rotations, axis=1)
     
     # Flatten to get 1D arrays
     phi_array = phi_s2.flatten()

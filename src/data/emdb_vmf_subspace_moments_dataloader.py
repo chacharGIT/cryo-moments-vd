@@ -27,8 +27,8 @@ class EMDBvMFSubspaceMomentsDataset(Dataset):
     - first_moments: First analytical moments
     - volume_ids: EMDB volume identifiers
     """
-    
-    def __init__(self, zarr_path: str, transform=None):
+
+    def __init__(self, zarr_path: str, transform=None, debug=False):
         """
         Initialize the dataset.
         
@@ -48,10 +48,15 @@ class EMDBvMFSubspaceMomentsDataset(Dataset):
             'eigen_images': self.root['eigen_images'].shape[1:],
             'eigen_values': self.root['eigen_values'].shape[1:],
             'first_moments': self.root['first_moments'].shape[1:],
+            'distribution_evaluations': self.root['distribution_evaluations'].shape[1:]
         }
-        print(f"Loaded EMDB vMF subspace moments dataset with {self.length} samples")
-        print(f"Sample shapes: {self.shapes}")
-        print(f"Chunk size: {self.root['s2_distribution_means'].chunks[0]}")
+        if debug:
+            print(f"Loaded EMDB vMF subspace moments dataset with {self.length} samples")
+            print(f"Sample shapes: {self.shapes}")
+            print(f"Chunk size: {self.root['s2_distribution_means'].chunks[0]}")
+            print("Zarr array shapes for debug:")
+            for key in self.root.array_keys():
+                print(f"  {key}: {self.root[key].shape}")
     
     def __len__(self) -> int:
         return self.length
@@ -70,10 +75,9 @@ class EMDBvMFSubspaceMomentsDataset(Dataset):
             indices = [int(i) for i in indices]
         else:
             raise TypeError(f"__getitem__ expects a single int or a list/array of integers, got: {indices}")
-        print(f"Loading batch with indices: {indices}")
         tensor_fields = [
             's2_distribution_means', 's2_distribution_kappas', 's2_distribution_weights',
-            'eigen_images', 'eigen_values', 'first_moments'
+            'eigen_images', 'eigen_values', 'first_moments', 'distribution_evaluations'
         ]
         # Ensure indices are a plain list of ints
         indices = [int(i) for i in indices]
@@ -82,6 +86,21 @@ class EMDBvMFSubspaceMomentsDataset(Dataset):
             batch_data = self.root[key][indices]
             batch[key] = torch.from_numpy(np.ascontiguousarray(batch_data)).float()
         batch['volume_id'] = [self.root['volume_ids'][i] for i in indices]
+
+        # --- Normalize first moments by L1 norm per sample ---
+        epsilon = 1e-8
+        first_moments = batch['first_moments']  # shape: [B, ...]
+        # Compute L1 norm for each sample in batch
+        norms = first_moments.view(first_moments.shape[0], -1).abs().sum(dim=1, keepdim=True)  # [B, 1]
+        # Avoid division by zero
+        norms = norms + epsilon
+        # Reshape for broadcasting
+        norm_shape = [first_moments.shape[0]] + [1] * (first_moments.dim() - 1)
+        batch['first_moments'] = first_moments / norms.view(*norm_shape)
+        
+        # Normalize eigen_values (second moment) by norm squared
+        batch['eigen_values'] = batch['eigen_values'] / (norms ** 2)
+
         if self.transform:
             batch = self.transform(batch)
         return batch
@@ -91,7 +110,6 @@ class ChunkShuffleIterableDataset(IterableDataset):
         self.dataset = dataset
         self.shuffle = shuffle
         self.device = device
-        # Infer zarr chunk size
         zarr_root = dataset.root
         first_key = next(iter(zarr_root.array_keys()))
         self.chunk_size = zarr_root[first_key].chunks[0]
@@ -103,25 +121,39 @@ class ChunkShuffleIterableDataset(IterableDataset):
         chunk_indices = list(range(n_chunks))
         if self.shuffle:
             np.random.shuffle(chunk_indices)
-        for chunk_idx in chunk_indices:
-            start = chunk_idx * self.chunk_size
+        current_chunk_cursor = 0
+        chunk_ptr = 0  # pointer within current chunk
+        batch_indices = []
+        while current_chunk_cursor < len(chunk_indices):
+            current_chunk = chunk_indices[current_chunk_cursor]
+            start = current_chunk * self.chunk_size
             end = min(start + self.chunk_size, n_samples)
-            if start >= end:
-                continue  # skip empty batch
-            chunk_indices_list = list(range(start, end))
-            # Split chunk into batches of batch_size
-            for batch_start in range(0, len(chunk_indices_list), self.batch_size):
-                batch_indices = chunk_indices_list[batch_start:batch_start + self.batch_size]
-                if not batch_indices:
-                    continue
-                batch = self.dataset[batch_indices]
+            remaining_in_chunk = end - (start + chunk_ptr)
+            need = self.batch_size - len(batch_indices)
+            take = min(need, remaining_in_chunk)
+            batch_indices.extend(list(range(start + chunk_ptr, start + chunk_ptr + take)))
+            chunk_ptr += take
+            if start + chunk_ptr == end:
+                current_chunk_cursor += 1
+                chunk_ptr = 0
+            if len(batch_indices) == self.batch_size:
                 if self.device is not None:
-                    batch = to_device(batch, self.device)
+                    batch = to_device(self.dataset[batch_indices], self.device)
+                else:
+                    batch = self.dataset[batch_indices]
                 yield batch
+                batch_indices = []
+        # Yield any remaining samples as a final (smaller) batch
+        if batch_indices:
+            if self.device is not None:
+                batch = to_device(self.dataset[batch_indices], self.device)
+            else:
+                batch = self.dataset[batch_indices]
+            yield batch
 
 def create_subspace_moments_dataloader(zarr_path: str, batch_size: int = None, 
                                       shuffle: bool = True, transform=None, num_workers: int = 0,
-                                      pin_memory: bool = False) -> DataLoader:
+                                      debug: bool = False) -> DataLoader:
     """
     Create an optimized DataLoader for subspace moments EMDB data with vMF mixtures.
     Uses batch-level Zarr reading for maximum efficiency with large samples.
@@ -132,15 +164,13 @@ def create_subspace_moments_dataloader(zarr_path: str, batch_size: int = None,
         shuffle: Whether to shuffle data
         transform: Optional transform function (applied at batch level)
         num_workers: Number of worker processes for data loading
-        pin_memory: Pin memory for faster GPU transfer
-        
+        debug: Print debug info
     Returns:
         PyTorch DataLoader instance optimized for batch loading
     """
     if batch_size is None:
         batch_size = settings.training.batch_size
-    
-    dataset = EMDBvMFSubspaceMomentsDataset(zarr_path, transform=transform)
+    dataset = EMDBvMFSubspaceMomentsDataset(zarr_path, transform=transform, debug=debug)
     if settings.device.use_cuda:
         device = f"cuda:{settings.device.cuda_device}"
     else:
@@ -149,7 +179,6 @@ def create_subspace_moments_dataloader(zarr_path: str, batch_size: int = None,
     dataloader = DataLoader(
         iterable_dataset,
         num_workers=num_workers,
-        pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
         collate_fn=lambda x: x[0]
     )
@@ -172,12 +201,25 @@ if __name__ == "__main__":
     zarr_path = "/data/shachar/zarr_files/emdb_vmf_top_eigen.zarr"
 
     try:
-        dataloader = create_subspace_moments_dataloader(zarr_path, batch_size=100, shuffle=True, num_workers=0)
+        dataloader = create_subspace_moments_dataloader(zarr_path, batch_size=200, shuffle=True, num_workers=0)
         print(f"DataLoader created.")
-        n_batches = 10
+        n_batches = 25
         start_time = time.time()
         for batch_idx, batch in enumerate(dataloader):
             print(f"Batch {batch_idx}:")
+            first_moments = batch['first_moments']  # [B, ...]
+            eigen_values = batch['eigen_values']    # [B, N]
+            # Compute L1 norm of first moments per sample
+            norms = first_moments.view(first_moments.shape[0], -1).abs().sum(dim=1)
+            # Compute sum of eigenvalues per sample
+            eigen_sums = eigen_values.sum(dim=1)
+            n_kept = (batch['eigen_values'][0] != 0).sum().item()
+            # Print only the first item in the batch
+            print(f"  Item 0: L1 norm(first_moment) = {norms[0].item():.6f}, sum(eigen_values) = {eigen_sums[0].item():.3e}")
+            # Print sum of distribution_evaluations for first item if present
+            dist_eval_sum = batch['distribution_evaluations'][0].sum().item()
+            print(f"  Item 0: sum(distribution_evaluations) = {dist_eval_sum:.6f}")
+            print(f"  Item 0: number of kept eigenvalues = {n_kept}")
             if batch_idx + 1 >= n_batches:
                 break
         elapsed = time.time() - start_time

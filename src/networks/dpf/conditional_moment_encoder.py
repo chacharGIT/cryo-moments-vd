@@ -67,19 +67,39 @@ class CryoMomentsConditionalEncoder(nn.Module):
         output_dim (int): Output feature dimension from the final linear layer.
         unet_out_channels (int): Number of output channels from the first moment UNet.
     """
-    def __init__(self, output_dim, num_queries_eig, unet_out_channels):
+    def __init__(self, output_dim, num_queries_eig, unet_out_channels, D):
         super().__init__()
         self.output_dim = output_dim
         self.num_queries_eig = num_queries_eig
-        self.queries = None  # Will be initialized on first forward
-        self.first_moment_unet = FirstMomentUNet(in_channels=1, out_channels=unet_out_channels)
         self.unet_out_channels = unet_out_channels
+        self.D = D
+        self.queries_eig = nn.Parameter(torch.randn(num_queries_eig, D))
+        self.first_moment_unet = FirstMomentUNet(out_channels=unet_out_channels)
+        # Conv to reduce attended images channels
+        reduced_channels = num_queries_eig // 2
+        self.second_moment_conv = nn.Conv2d(num_queries_eig, reduced_channels, kernel_size=3, padding=1)
+        self.reduced_channels = reduced_channels
+        # CNN stack: [B, C, H, W] -> [B, final_out_ch, 4, 4]
+        l = int(D ** 0.5)
+        in_ch = reduced_channels + unet_out_channels
+        num_layers = int(math.log2(l // 4))
+        chs = [256, 128, 128, 64]
+        layers = []
+        for i in range(num_layers):
+            out_ch = chs[i] if i < len(chs) else chs[-1]
+            layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1))
+            layers.append(nn.ReLU())
+            in_ch = out_ch
+        self.cnn = nn.Sequential(*layers)
+        # Final linear layer
+        final_feat_dim = out_ch * 4 * 4
+        self.final_linear = nn.Linear(final_feat_dim, output_dim)
 
     def forward(self, second_moment_subspace, first_moment_image, eigen_values, return_basis_images=False):
         """
         Args:
-            second_moment_subspace (Tensor): [B, N, D] tensor of orthogonal second moment images (flattened).
-            first_moment_image (Tensor): [B, 1, l, l] tensor of the first moment (mean projection) image.
+            second_moment_subspace (Tensor): [B, N, D] tensor of orthogonal second moment images (flattened D=l^2).
+            first_moment_image (Tensor): [B, l, l] tensor of the first moment (mean projection) image.
             eigen_values (Tensor): [B, N] tensor of eigenvalues for weighting the second moment subspace.
             return_basis_images (bool): If True, also return the learned basis images (for visualization/debug).
 
@@ -91,38 +111,23 @@ class CryoMomentsConditionalEncoder(nn.Module):
         # --- Eigenvalue attention ---
         eig_weighted = second_moment_subspace * eigen_values.sqrt().unsqueeze(-1)  # [B, N, D]
         # --- Attention weights and queries ---
-        if (not hasattr(self, 'queries_eig')) or (self.queries_eig is None) or (self.queries_eig.shape[0] != self.num_queries_eig):
-            self.queries_eig = nn.Parameter(torch.randn(self.num_queries_eig, D, device=second_moment_subspace.device))
-        attn_logits = torch.matmul(self.queries_eig, eig_weighted.transpose(1,2)) * (D ** -0.5)  # [max_len_eig, B, max_len_eig]
-        attn_logits = attn_logits.permute(1,0,2)  # [B, max_len_eig, max_len_eig]
-        attn_weights = F.softmax(attn_logits, dim=-1)  # [B, max_len_eig, max_len_eig]
-        attended = torch.bmm(attn_weights, eig_weighted)  # [B, max_len_eig, D]
+        attn_logits = torch.matmul(eig_weighted, self.queries_eig.t()) * (D ** -0.5)  # [B, N, num_queries_eig]
+        attn_logits = attn_logits.permute(0, 2, 1)  # [B, num_queries_eig, N]
+        attn_weights = F.softmax(attn_logits, dim=-1)  # [B, num_queries_eig, N]
+        attended = torch.bmm(attn_weights, eig_weighted)  # [B, num_queries_eig, D]
         # Reshape to images
         l = int(D ** 0.5)
         attended_images = attended.view(B, self.num_queries_eig, l, l)
-        # One conv layer before concatenation
-        reduced_channels = self.num_queries_eig // 2
-        self.second_moment_conv = nn.Conv2d(self.num_queries_eig, reduced_channels, kernel_size=3, padding=1, device=attended_images.device)
         attended_images_reduced = self.second_moment_conv(attended_images)  # [B, reduced_channels, l, l]
         # --- UNet for first moment image ---
-        # first_moment_image: [B, 1, l, l] (not flattened)
+        if first_moment_image.ndim == 3:
+            first_moment_image = first_moment_image.unsqueeze(1)  # [B, 1, l, l]
         unet_out = self.first_moment_unet(first_moment_image)  # [B, unet_out_channels, l, l]
         # Concatenate UNet output to reduced attended images along channel dim
         cnn_input = torch.cat([attended_images_reduced, unet_out], dim=1)  # [B, reduced_channels+unet_out_channels, l, l]
-        # CNN: [B, C, H, W] -> [B, final_out_ch, 4, 4]
-        in_ch = cnn_input.shape[1]
-        num_layers = int(math.log2(l // 4))
-        chs = [256, 128, 128, 64]
-        layers = []
-        for i in range(num_layers):
-            out_ch = chs[i] if i < len(chs) else chs[-1]
-            layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1))
-            layers.append(nn.ReLU())
-            in_ch = out_ch
-        cnn = nn.Sequential(*layers)
-        cond_feat = cnn(cnn_input)
+        cond_feat = self.cnn(cnn_input)
         cond_feat = cond_feat.view(cond_feat.size(0), -1)
-        cond_feat = nn.Linear(cond_feat.size(1), self.output_dim, device=cond_feat.device)(cond_feat)
+        cond_feat = self.final_linear(cond_feat)
         if return_basis_images:
             # Return the actual basis images (queries) as well, reshaped
             l = int(D ** 0.5)

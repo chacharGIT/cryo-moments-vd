@@ -1,14 +1,19 @@
 import matplotlib.pyplot as plt
 import torch
 import numpy as np
+import zarr
+import random
 from config.config import settings
 from src.networks.dpf.score_network import S2ScoreNetwork
 from src.networks.dpf.sample_generation import build_network_input, generate_vmf_mixture_on_s2
 from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_schedule, beta_schedule
+from src.networks.dpf.conditional_moment_encoder import CryoMomentsConditionalEncoder
+
 # DPM-Solver++ integration
 from packages.dpm_solver.dpm_solver_pytorch import model_wrapper, DPM_Solver
 
-def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_step_size=1e-2, initial_langevin_steps=3):
+def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_step_size=1e-2,
+                                cond_feat=None, use_guidance=False):
     """
     Start with a few Langevin steps, then alternate blocks of DPM-Solver++ (order 3, steps 3) and Langevin steps.
 
@@ -50,7 +55,15 @@ def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_s
         context_encoding = context_encoding.to(model.parameters().__next__().dtype)
         query_encoding = context_encoding
         with torch.no_grad():
-            score = model(context=context_encoding, queries=query_encoding).squeeze(-1)
+            if cond_feat is not None:
+                cond_score = model(context=context_encoding, queries=query_encoding, cond_feat=cond_feat).squeeze(-1)
+            if cond_feat is None or use_guidance:
+                score = model(context=context_encoding, queries=query_encoding).squeeze(-1)
+        if cond_feat is not None and use_guidance:
+            w = 1 # Guidance weight
+            score = score + w * (cond_score - score)
+        elif cond_feat is not None and not use_guidance:
+            score = cond_score
         # Cast score back to float64 for solver
         return score.to(torch.float64)
 
@@ -134,10 +147,13 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{settings.device.cuda_device}" if settings.device.use_cuda and torch.cuda.is_available() else "cpu")
     model = S2ScoreNetwork().to(device)
 
-    checkpoint = torch.load("./outputs/model_parameter_files/dpf_test_5_epoch_1700.pth", map_location=device)
+    checkpoint = torch.load("./outputs/model_parameter_files/dpf_cond_test_2_epoch_19_batch_1600.pth", map_location=device)
     # Selection: plot single timestep or run full diffusion inference
     mode = "diffusion" # "single" or "diffusion"
-    t_value = 0.9 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
+    t_value = 0.88 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
+    use_conditional = True
+    plot_conditional_vs_unconditional_comparison = True
+    use_guidance = True
     use_zarr_example = False
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -153,18 +169,36 @@ if __name__ == "__main__":
     # Common function generation code
     batch = 1
     n_points = points.shape[1]
-    if use_zarr_example:
-        import zarr
-        import os
-        import random
-        zarr_path = os.path.join(settings.data_generation.zarr.save_dir, "vmf_mixtures_evaluations.zarr")
+    if use_conditional:
+        zarr_path = "/data/shachar/zarr_files/emdb_vmf_top_eigen.zarr"
         z = zarr.open(zarr_path, mode='r')
-        num_examples = z['func_data'].shape[0]
+        num_examples = z['distribution_evaluations'].shape[0]
         idx = random.randint(0, num_examples - 1)
-        func_data = torch.from_numpy(z['func_data'][idx:idx+1]).float().to(device)
+        func_data = torch.from_numpy(z['distribution_evaluations'][idx:idx+1]).float().to(device)
+        eigen_images = torch.from_numpy(z['eigen_images'][idx:idx+1]).float().to(device)
+        eigen_values = torch.from_numpy(z['eigen_values'][idx:idx+1]).float().to(device)
+        first_moments = torch.from_numpy(z['first_moments'][idx:idx+1]).float().to(device)
+        # Instantiate conditional encoder
+        D = eigen_images.shape[1]
+        cond_encoder = CryoMomentsConditionalEncoder(
+            output_dim=settings.dpf.perceiver.latent_dim,
+            num_queries_eig=settings.dpf.conditional_moment_encoder.num_queries_eig,
+            unet_out_channels=settings.dpf.conditional_moment_encoder.first_moment_unet_out_channels,
+            D=D
+        ).to(device)
+        cond_feat = cond_encoder(eigen_images.transpose(1, 2), first_moments, eigen_values)
     else:
-        _, func_data, _ = generate_vmf_mixture_on_s2(batch_size=batch)
-        func_data = torch.from_numpy(func_data).float().to(device)
+        if use_zarr_example:
+            import os
+            zarr_path = os.path.join(settings.data_generation.zarr.save_dir, "vmf_mixtures_evaluations.zarr")
+            z = zarr.open(zarr_path, mode='r')
+            num_examples = z['func_data'].shape[0]
+            idx = random.randint(0, num_examples - 1)
+            func_data = torch.from_numpy(z['func_data'][idx:idx+1]).float().to(device)
+        else:
+            _, func_data, _ = generate_vmf_mixture_on_s2(batch_size=batch)
+            func_data = torch.from_numpy(func_data).float().to(device)
+        cond_feat = None
     func_data = func_data / (func_data.std(dim=1, keepdim=True))
 
     if mode == 'single':
@@ -178,27 +212,54 @@ if __name__ == "__main__":
         context_encoding = context_encoding.to(torch.float64)
         query_encoding = context_encoding.to(torch.float64)
         with torch.no_grad():
-            pred_score = model(context=context_encoding, queries=query_encoding)
+            # cond_feat is None if not using conditional model
+            pred_score = model(context=context_encoding, queries=query_encoding, cond_feat=cond_feat)
         scaling_t = cosine_signal_scaling_schedule(t).reshape(-1, *([1] * (x_t.dim() - 1)))
         x0_est = (x_t + pred_score.squeeze(-1) * (1 - scaling_t)) / torch.sqrt(scaling_t)
         true_score = -(x_t - torch.sqrt(scaling_t) * func_data) / (1 - scaling_t)
-        print(f'true_score stats: min={true_score.min().item():.4g}, max={true_score.max().item():.4g}, mean={true_score.mean().item():.4g}, std={true_score.std().item():.4g}')
-        print(f'pred_score stats: min={pred_score.min().item():.4g}, max={pred_score.max().item():.4g}, mean={pred_score.mean().item():.4g}, std={pred_score.std().item():.4g}')
-        plot_s2_comparison(points, {
-            "x_0 (clean)": func_data,
-            "x_t (noised)": x_t,
-            "x_0 est (network)": x0_est,
-            "true score": true_score,
-            "pred score": pred_score.squeeze(-1)
-        }, t=t_value)
+        if plot_conditional_vs_unconditional_comparison:
+            with torch.no_grad():
+                    pred_score_uncond = model(context=context_encoding, queries=query_encoding, cond_feat=None)
+            x0_est_uncond = (x_t + pred_score_uncond.squeeze(-1) * (1 - scaling_t)) / torch.sqrt(scaling_t)
+            print("Conditional vs True difference (MSE):", torch.mean((func_data - x0_est) ** 2).item())
+            print("Unconditional vs True difference (MSE):", torch.mean((func_data - x0_est_uncond) ** 2).item())
+            plot_s2_comparison(points, {
+                "x_0 (clean)": func_data,
+                "x_t (noised)": x_t,
+                "x_0 est (network, conditional)": x0_est,
+                "x_0 est (network, unconditional)": x0_est_uncond
+            }, t=t_value)
+        else:        
+            plot_s2_comparison(points, {
+                "x_0 (clean)": func_data,
+                "x_t (noised)": x_t,
+                "x_0 est (network)": x0_est,
+            }, t=t_value)
+        
+            
     elif mode == 'diffusion':
         t = torch.full((batch,), t_value, device=device)
         initial_image = q_sample(func_data, t)
-        x0_est = diffusion_inference_process(model, points, initial_image, t_start=t_value)
-        plot_s2_comparison(points, {
-            "x_0 (clean)": func_data,
-            f"Initial image (t={t_value})": initial_image,
-            "x_0 est (diffusion)": x0_est
-        }, t=None)
+
+        # cond_feat is None if not using conditional model
+        x0_est = diffusion_inference_process(model, points, initial_image, t_start=t_value, cond_feat=cond_feat,
+                                              use_guidance=use_guidance)
+        if plot_conditional_vs_unconditional_comparison:
+            x0_est_uncond = diffusion_inference_process(model, points, initial_image, t_start=t_value, cond_feat=None,
+                                                         use_guidance=use_guidance)
+            plot_s2_comparison(points, {
+                "x_0 (clean)": func_data,
+                f"Initial image (t={t_value})": initial_image,
+                "x_0 est (diffusion, conditional)": x0_est,
+                "x_0 est (diffusion, unconditional)": x0_est_uncond
+            }, t=None)
+            print("Conditional vs True difference (MSE):", torch.mean((func_data - x0_est) ** 2).item())
+            print("Unconditional vs True difference (MSE):", torch.mean((func_data - x0_est_uncond) ** 2).item())
+        else:
+            plot_s2_comparison(points, {
+                "x_0 (clean)": func_data,
+                f"Initial image (t={t_value})": initial_image,
+                "x_0 est (diffusion)": x0_est
+            }, t=None)
     else:
         print("Invalid mode. Please choose 'single' or 'diffusion'.")
