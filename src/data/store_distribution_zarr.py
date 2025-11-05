@@ -2,7 +2,7 @@ import os
 import zarr
 import numpy as np
 from config.config import settings
-from src.utils.von_mises_fisher_distributions import generate_random_von_mises_fisher_parameters, evaluate_von_mises_fisher_mixture
+from src.utils.von_mises_fisher_distributions import generate_random_vmf_parameters, evaluate_vmf_mixture
 from src.utils.distribution_generation_functions import fibonacci_sphere_points
 
 def main():
@@ -35,8 +35,8 @@ def main():
         batch_mu = np.zeros((bsize, num_components, 3), dtype=np.float64)
         batch_weights = np.zeros((bsize, num_components), dtype=np.float64)
         for j in range(bsize):
-            mu, kappa, weights = generate_random_von_mises_fisher_parameters(num_components, kappa_start, kappa_mean)
-            pdf = evaluate_von_mises_fisher_mixture(quadrature_points, mu, kappa, weights)
+            mu, kappa, weights = generate_random_vmf_parameters(num_components, kappa_start, kappa_mean)
+            pdf = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
             batch_func_data[j] = pdf
             batch_kappa[j] = kappa
             batch_mu[j] = mu

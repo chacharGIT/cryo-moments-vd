@@ -180,10 +180,9 @@ def create_in_plane_invariant_distribution(s2_points, s2_weights=None, num_in_pl
     psi_0 = np.random.uniform(0, 2*np.pi, num_s2_points)
     # For each S2 point, generate evenly spaced psi angles starting from psi_0
     in_plane_angles = psi_0[:, None] + np.arange(num_in_plane_rotations) * 2 * np.pi / num_in_plane_rotations
-    in_plane_angles = in_plane_angles % (2 * np.pi)
-    
+    psi_in_plane = in_plane_angles % (2 * np.pi)
     # Use meshgrid to create all combinations efficiently
-    phi_s2, psi_in_plane = np.meshgrid(phi, in_plane_angles, indexing='ij')
+    phi_s2 = np.repeat(phi[:, None], num_in_plane_rotations, axis=1)
     theta_s2 = np.repeat(theta[:, None], num_in_plane_rotations, axis=1)
     
     # Flatten to get 1D arrays
@@ -195,7 +194,7 @@ def create_in_plane_invariant_distribution(s2_points, s2_weights=None, num_in_pl
     
     # Stack angles for ASPIRE's from_euler
     euler_angles = np.stack([phi_array, theta_array, psi_array], axis=1)
-    # Create Rotation object (ZYZ convention)`)
+    # Create Rotation object (ZYZ convention)
     rotations = Rotation.from_euler(euler_angles, dtype=np.float32)
 
     return rotations, distribution

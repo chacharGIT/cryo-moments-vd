@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from e3nn.o3 import spherical_harmonics
 
-from src.utils.von_mises_fisher_distributions import generate_random_von_mises_fisher_parameters, evaluate_von_mises_fisher_mixture
+from src.utils.von_mises_fisher_distributions import generate_random_vmf_parameters, evaluate_vmf_mixture
 from src.utils.distribution_generation_functions import fibonacci_sphere_points
 from config.config import settings
 
@@ -97,11 +97,11 @@ def generate_vmf_mixture_on_s2(batch_size=1):
     pdf_batch = []
     params_batch = []
     for _ in range(batch_size):
-        mu_directions, kappa_values, mixture_weights = generate_random_von_mises_fisher_parameters(
+        mu_directions, kappa_values, mixture_weights = generate_random_vmf_parameters(
             num_components, kappa_start, kappa_mean
         )
         points = fibonacci_sphere_points(n_quadrature)  # numpy array [n_quadrature, 3]
-        mixture_pdf = evaluate_von_mises_fisher_mixture(
+        mixture_pdf = evaluate_vmf_mixture(
             points, mu_directions, kappa_values, mixture_weights
         )  # mixture_pdf: numpy array [n_quadrature]
         points_batch.append(points)

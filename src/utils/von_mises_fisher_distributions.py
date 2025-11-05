@@ -2,7 +2,7 @@ import numpy as np
 from config.config import settings
 from src.utils.distribution_generation_functions import cartesian_to_spherical, create_in_plane_invariant_distribution
 
-def von_mises_fisher_normalization_constant(kappa):
+def vmf_normalization_constant(kappa):
     """
     Calculate the normalization constant for von-Mises Fisher distribution on S^(2).
     
@@ -25,7 +25,7 @@ def von_mises_fisher_normalization_constant(kappa):
     return result if result.shape else float(result)
 
 
-def von_mises_fisher_pdf(x, mu, kappa):
+def evaluate_vmf_pdf(x, mu, kappa):
     """
     Evaluate the von-Mises Fisher probability density function on S2.
     
@@ -59,7 +59,7 @@ def von_mises_fisher_pdf(x, mu, kappa):
     # Clamp kappa to avoid overflow in exp, using config
     kappa = np.clip(kappa, 0, settings.data_generation.von_mises_fisher.kappa_clamp_max)
     # Get normalization constants
-    C = von_mises_fisher_normalization_constant(kappa)
+    C = vmf_normalization_constant(kappa)
 
     # Use numerically stable exponentials
     # Subtract max for stability
@@ -77,7 +77,7 @@ def von_mises_fisher_pdf(x, mu, kappa):
 
     return pdf_values
 
-def generate_random_von_mises_fisher_parameters(num_distributions, kappa_start, kappa_mean):
+def generate_random_vmf_parameters(num_distributions, kappa_start, kappa_mean):
     """
     Generate random parameters for von-Mises Fisher distributions including mixture weights.
     kappa is sampled from a translated exponential distribution:
@@ -112,7 +112,7 @@ def generate_random_von_mises_fisher_parameters(num_distributions, kappa_start, 
     mixture_weights = mixture_weights / np.sum(mixture_weights)
     return mu_directions, kappa_values, mixture_weights
 
-def evaluate_von_mises_fisher_mixture(quadrature_points, mu_directions, kappa_values, mixture_weights):
+def evaluate_vmf_mixture(quadrature_points, mu_directions, kappa_values, mixture_weights):
     """
     Evaluate a linear combination (mixture) of von-Mises Fisher distributions at quadrature points.
     
@@ -142,7 +142,7 @@ def evaluate_von_mises_fisher_mixture(quadrature_points, mu_directions, kappa_va
         quadrature_points = quadrature_points.reshape(1, -1)
     
     # Evaluate each von-Mises Fisher distribution
-    pdf_values = von_mises_fisher_pdf(quadrature_points, mu_directions, kappa_values)
+    pdf_values = evaluate_vmf_pdf(quadrature_points, mu_directions, kappa_values)
     
     # If single distribution, reshape for consistency
     if pdf_values.ndim == 1 and len(mixture_weights) > 1:
@@ -156,11 +156,11 @@ def evaluate_von_mises_fisher_mixture(quadrature_points, mu_directions, kappa_va
     
     return mixture_pdf / np.sum(mixture_pdf) # Normalize to sum to 1
 
-def so3_distribution_from_von_mises_mixture(quadrature_points, mu_directions, kappa_values, mixture_weights, num_in_plane_rotations):
+def so3_distribution_from_vmf(quadrature_points, mu_directions, kappa_values, mixture_weights, num_in_plane_rotations):
     """
     Given S2 quadrature points, von Mises mixture parameters, and in-plane rotations, return SO(3) rotations and weights, and S2 weights.
     """
-    s2_pdf_values = evaluate_von_mises_fisher_mixture(
+    s2_pdf_values = evaluate_vmf_mixture(
         quadrature_points, mu_directions, kappa_values, mixture_weights
     )
     s2_weights = s2_pdf_values / np.sum(s2_pdf_values)
@@ -183,13 +183,13 @@ if __name__ == "__main__":
     
     # Generate von-Mises Fisher parameters
     num_vmf = settings.data_generation.von_mises_fisher.num_distributions
-    mu_directions, kappa_values, mixture_weights = generate_random_von_mises_fisher_parameters(
+    mu_directions, kappa_values, mixture_weights = generate_random_vmf_parameters(
         num_vmf, kappa_start=settings.data_generation.von_mises_fisher.kappa_start, 
         kappa_mean=settings.data_generation.von_mises_fisher.kappa_mean
     )
     
     # Create SO(3) distribution and S2 weights from von Mises mixture
-    rotations, rotation_weights, s2_weights = so3_distribution_from_von_mises_mixture(
+    rotations, rotation_weights, s2_weights = so3_distribution_from_vmf(
         quadrature_points, mu_directions, kappa_values, mixture_weights, settings.data_generation.von_mises_fisher.num_in_plane_rotations
     )
 

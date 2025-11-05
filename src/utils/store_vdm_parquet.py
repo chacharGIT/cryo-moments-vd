@@ -7,8 +7,8 @@ from aspire.downloader import emdb_2660
 from src.core.volume_distribution_model import VolumeDistributionModel
 from src.utils.distribution_generation_functions import fibonacci_sphere_points
 from von_mises_fisher_distributions import (
-    generate_random_von_mises_fisher_parameters,
-    so3_distribution_from_von_mises_mixture
+    generate_random_vmf_parameters,
+    so3_distribution_from_vmf
 )
 from config.config import settings
 
@@ -110,12 +110,12 @@ if __name__ == "__main__":
 
     # Generate von-Mises Fisher mixture parameters
     num_vmf = settings.data_generation.von_mises_fisher.num_distributions
-    mu_directions, kappa_values, mixture_weights = generate_random_von_mises_fisher_parameters(
+    mu_directions, kappa_values, mixture_weights = generate_random_vmf_parameters(
         num_vmf, kappa_range=tuple(settings.data_generation.von_mises_fisher.kappa_range)
     )
 
     # Create SO(3) distribution and S2 weights from von Mises mixture
-    rotations, distribution = so3_distribution_from_von_mises_mixture(
+    rotations, distribution = so3_distribution_from_vmf(
         quadrature_points, mu_directions, kappa_values, mixture_weights, settings.data_generation.von_mises_fisher.num_in_plane_rotations
     )
 

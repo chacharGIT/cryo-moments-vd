@@ -190,7 +190,7 @@ class VolumeDistributionModel:
             return projections, rotations_to_project
     
     def first_analytical_moment(self, num_projections_per_s2_point=1,
-                                 n_theta=settings.data_generation.cartesian_to_polar_n_theta, device=None):
+                                 n_theta=settings.data_generation.cartesian_to_polar_n_theta, dtype=torch.float64):
         """
         Calculate the first analytical moment.
         For in-plane invariant distributions, averages the polar representation of projections over theta,
@@ -217,8 +217,8 @@ class VolumeDistributionModel:
             else:
                 device = "cpu"
             projections = self.generate_projections(rotations_to_project=self.rotations)
-            weights_t = torch.from_numpy(weights).to(device=device, dtype=torch.float64)
-            projections_t = torch.from_numpy(projections).to(device=device, dtype=torch.float64)
+            weights_t = torch.from_numpy(weights).to(device=device, dtype=dtype)
+            projections_t = torch.from_numpy(projections).to(device=device, dtype=dtype)
             weighted_projections = projections_t * weights_t[:, None, None]
             first_moment = torch.sum(weighted_projections, dim=0)
             return first_moment.cpu().numpy()
@@ -344,11 +344,20 @@ if __name__ == "__main__":
     from aspire.volume import Volume
     from aspire.utils.rotation import Rotation
     from config.config import settings
-    from src.utils.von_mises_fisher_distributions import generate_random_von_mises_fisher_parameters, evaluate_von_mises_fisher_mixture
+    from src.utils.von_mises_fisher_distributions import generate_random_vmf_parameters, evaluate_vmf_mixture
 
     # Load volume and ensure mean zero
-    from aspire.downloader import emdb_2660
-    vol_ds = emdb_2660().downsample(settings.data_generation.downsample_size)
+    from src.data.emdb_downloader import load_aspire_volume
+    downsample_size = settings.data_generation.downsample_size
+
+    emdb_id = "emd_47031"
+    emdb_path = f"/data/shachar/emdb_downloads/{emdb_id}.map.gz"
+    save_dir = f"outputs/spectral_analysis/{emdb_id}"
+    
+    # Generate VDM using the generator
+    print("\n1. Loading volume and generating VDM...")
+    volume = load_aspire_volume(emdb_path, downsample_size=settings.data_generation.downsample_size)
+    vol_ds = volume.downsample(downsample_size)
     L = vol_ds.resolution
 
     # Get VMF parameters from config
@@ -359,14 +368,14 @@ if __name__ == "__main__":
     quadrature_points = fibonacci_sphere_points(n=vmf_cfg.fibonacci_spiral_n)
 
     # Generate VMF mixture parameters
-    mu, kappa, weights = generate_random_von_mises_fisher_parameters(
+    mu, kappa, weights = generate_random_vmf_parameters(
         vmf_cfg.num_distributions, kappa_start=vmf_cfg.kappa_start, kappa_mean=vmf_cfg.kappa_mean
     )
-    s2_distribution = evaluate_von_mises_fisher_mixture(quadrature_points, mu, kappa, weights)
+    s2_distribution = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
 
     from src.utils.distribution_generation_functions import generate_weighted_random_s2_points
     import numpy as np
-    quadrature_points, s2_distribution = generate_weighted_random_s2_points(1)
+    # quadrature_points, s2_distribution = generate_weighted_random_s2_points(1)
     
     vdm1 = VolumeDistributionModel(vol_ds, rotations=quadrature_points, distribution=s2_distribution,
                                    distribution_metadata={
@@ -381,34 +390,32 @@ if __name__ == "__main__":
     #first_moment_1 = vdm1.first_analytical_moment(num_projections_per_s2_point=64, n_theta=256)
     #first_moment_2 = vdm1.first_analytical_moment(num_projections_per_s2_point=64, n_theta=256)
     from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution
-    import tqdm
     diff = 0
     diff_second = 0
-    for i in tqdm.tqdm(range(10)):
-        so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
-                                                                            num_in_plane_rotations=1024)
-        vdm = VolumeDistributionModel(vol_ds, rotations=so3_rotations, distribution=so3_weights,
-                                        distribution_metadata={
-                                            'type': 'vmf_mixture',
-                                            'means': mu,
-                                            'kappas': kappa,
-                                            'weights': weights
-                                        }, in_plane_invariant_distribution=False)
-        first_moment_1 = vdm.first_analytical_moment()
-        second_moment_1 = vdm.second_analytical_moment(batch_size=50)
-        so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
-                                                                            num_in_plane_rotations=1024)
-        vdm = VolumeDistributionModel(vol_ds, rotations=so3_rotations, distribution=so3_weights,
-                                        distribution_metadata={
-                                            'type': 'vmf_mixture',
-                                            'means': mu,
-                                            'kappas': kappa,
-                                            'weights': weights
-                                        }, in_plane_invariant_distribution=False)
-        first_moment_2 = vdm.first_analytical_moment()
-        second_moment_2 = vdm.second_analytical_moment(batch_size=50)
-        diff += np.linalg.norm(first_moment_1 - first_moment_2)
-        diff_second += np.linalg.norm(second_moment_1 - second_moment_2)
+    so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
+                                                                        num_in_plane_rotations=200)
+    vdm = VolumeDistributionModel(vol_ds, rotations=so3_rotations, distribution=so3_weights,
+                                    distribution_metadata={
+                                        'type': 'vmf_mixture',
+                                        'means': mu,
+                                        'kappas': kappa,
+                                        'weights': weights
+                                    }, in_plane_invariant_distribution=False)
+    first_moment_1 = vdm.first_analytical_moment()
+    second_moment_1 = vdm.second_analytical_moment(batch_size=50, show_progress=True)
+    so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
+                                                                        num_in_plane_rotations=200)
+    vdm = VolumeDistributionModel(vol_ds, rotations=so3_rotations, distribution=so3_weights,
+                                    distribution_metadata={
+                                        'type': 'vmf_mixture',
+                                        'means': mu,
+                                        'kappas': kappa,
+                                        'weights': weights
+                                    }, in_plane_invariant_distribution=False)
+    first_moment_2 = vdm.first_analytical_moment()
+    second_moment_2 = vdm.second_analytical_moment(batch_size=50, show_progress=True)
+    diff += np.linalg.norm(first_moment_1 - first_moment_2)
+    diff_second += np.linalg.norm(second_moment_1 - second_moment_2)
     # --- Compare results ---
-    print(f"Relative difference norm between first moments: {diff/(np.linalg.norm(first_moment_1)*10):.4e}")
-    print(f"Relative difference norm between second moments: {diff_second/(np.linalg.norm(second_moment_1)*10):.4e}")
+    print(f"Relative difference norm between first moments: {diff/(np.linalg.norm(first_moment_1)):.4e}")
+    print(f"Relative difference norm between second moments: {diff_second/(np.linalg.norm(second_moment_1)):.4e}")

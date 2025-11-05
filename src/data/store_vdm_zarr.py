@@ -5,8 +5,8 @@ from config.config import settings
 from src.core.volume_distribution_model import VolumeDistributionModel
 from src.utils.distribution_generation_functions import fibonacci_sphere_points
 from src.utils.von_mises_fisher_distributions import (
-    generate_random_von_mises_fisher_parameters,
-    so3_distribution_from_von_mises_mixture
+    generate_random_vmf_parameters,
+    so3_distribution_from_vmf
 )
 from src.data.emdb_downloader import load_aspire_volume
 
@@ -91,10 +91,10 @@ def process_emdb_volumes(override=False, max_examples=None):
             print(f"[{idx+1}/{len(file_list)}] Processing {filename} (EMDB {emdb_id}) for {zarr_file}")
             try:
                 vol = load_aspire_volume(map_path, downsample_size=settings.data_generation.downsample_size)
-                mu_directions, kappa_values, mixture_weights = generate_random_von_mises_fisher_parameters(
+                mu_directions, kappa_values, mixture_weights = generate_random_vmf_parameters(
                     num_vmf, kappa_range=tuple(settings.data_generation.von_mises_fisher.kappa_range)
                 )
-                rotations, distribution = so3_distribution_from_von_mises_mixture(
+                rotations, distribution = so3_distribution_from_vmf(
                     quadrature_points, mu_directions, kappa_values, mixture_weights, 
                     settings.data_generation.von_mises_fisher.num_in_plane_rotations
                 )

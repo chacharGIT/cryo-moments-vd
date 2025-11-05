@@ -10,8 +10,8 @@ from src.utils.distribution_generation_functions import (
     create_in_plane_invariant_distribution
 )
 from src.utils.von_mises_fisher_distributions import (
-    generate_random_von_mises_fisher_parameters,
-    so3_distribution_from_von_mises_mixture
+    generate_random_vmf_parameters,
+    so3_distribution_from_vmf
 )
 from config.config import settings
 
@@ -95,7 +95,7 @@ def _generate_vmf_mixture_vdm(volume: Volume) -> VolumeDistributionModel:
     
     # Generate random von Mises-Fisher mixture parameters
     print("\n2. Generating vMF mixture distribution...")
-    mu_directions, kappa_values, mixture_weights = generate_random_von_mises_fisher_parameters(
+    mu_directions, kappa_values, mixture_weights = generate_random_vmf_parameters(
         num_vmf_distributions, kappa_range
     )
     
@@ -105,7 +105,7 @@ def _generate_vmf_mixture_vdm(volume: Volume) -> VolumeDistributionModel:
     
     # Create S2 von Mises-Fisher mixture distribution on SO(3)
     print("\n3. Creating SO(3) distribution from vMF mixture...")
-    rotations, rotation_weights = so3_distribution_from_von_mises_mixture(
+    rotations, rotation_weights = so3_distribution_from_vmf(
         s2_quadrature_points, mu_directions, kappa_values, mixture_weights, num_in_plane
     )
     
