@@ -1,22 +1,25 @@
 import warnings
+
+from sympy import use
 # Suppress Zarr warnings about Python type strings
 warnings.filterwarnings("ignore", category=UserWarning, module="zarr")
 warnings.filterwarnings("ignore", message=".*object arrays.*", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*string.*", category=UserWarning)
-
+import os
 from tqdm import tqdm
 import zarr
 import numpy as np
+import torch
 from src.data.emdb_downloader import search_emdb_asymmetric_ids, download_emdb_map, load_aspire_volume
-from src.utils.von_mises_fisher_distributions import generate_random_von_mises_fisher_parameters
+from src.utils.von_mises_fisher_distributions import generate_random_vmf_parameters
 from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution, fibonacci_sphere_points
-from src.utils.von_mises_fisher_distributions import evaluate_von_mises_fisher_mixture
+from src.utils.von_mises_fisher_distributions import evaluate_vmf_mixture
 from src.core.volume_distribution_model import VolumeDistributionModel
-from src.utils.spectral_analysis import compute_second_moment_eigendecomposition
+from src.utils.subspace_moment_utils import compute_second_moment_eigendecomposition, num_components_for_energy_threshold, extract_dominant_eigenvector_modes
 from config.config import settings
 
 def main():
-    save_path = "/data/shachar/zarr_files/emdb_vmf_top_eigen.zarr"
+    save_path = "/data/shachar/zarr_files/emdb_vmf_subspace_moments_separated.zarr"
     save_interval = 100  # Save every save_interval samples
     root = zarr.open(save_path, mode='a')  # Use append mode
     # Use CUDA device from settings if enabled
@@ -28,71 +31,125 @@ def main():
     # Generate quadrature points once
     n_quadrature = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
     quadrature_points = fibonacci_sphere_points(n_quadrature)
-
+    use_precomputed = settings.data_generation.use_precomputed_delta_moments
+    separate_fourier_modes = settings.data_generation.separate_fourier_modes
     # Preallocate lists for all samples (to be periodically flushed)
     all_means = []
     all_kappas = []
     all_weights = []
-    all_eigen_images = []
+    if separate_fourier_modes:
+        all_eigen_radial_profiles = []
+        all_eigen_m_detected = []
+        all_eigen_energy_fractions = []
+    else:
+        all_eigen_images = []
     all_eigen_values = []
     all_first_moments = []
     all_volume_ids = []
     all_distribution_evaluations = []
     total_samples = 0
 
-    emdb_ids = search_emdb_asymmetric_ids(
-        resolution_cutoff=settings.data_generation.emdb.resolution_cutoff,
-        max_results=settings.data_generation.emdb.max_results
-    )
-    np.random.shuffle(emdb_ids)
-    num_mixtures_per_volume = settings.data_generation.von_mises_fisher.num_generated_examples // len(emdb_ids)
+    emdb_folder = settings.data_generation.emdb.download_folder
+    emdb_files = [os.path.join(emdb_folder, f) for f in os.listdir(emdb_folder) if f.endswith('.map.gz')]
+    np.random.shuffle(emdb_files)
+    if use_precomputed:
+        precomputed_folder = "/data/shachar/zarr_files/emdb_in_plane_invariant_moment_subspace_components"
+
+    num_mixtures_per_volume = settings.data_generation.von_mises_fisher.num_generated_examples_per_volume
     print("number of mixtures per volume:", num_mixtures_per_volume)
-    for emdb_id in tqdm(emdb_ids, desc="EMDB Volumes"):
+    for emdb_file in tqdm(emdb_files, desc="EMDB Volumes"):
+        emdb_id = os.path.basename(emdb_file).split('.')[0] 
+
         # Download map and load as aspire Volume
         print(f"Processing EMDB {emdb_id}")
         try:
-            map_path = download_emdb_map(emdb_id, settings.data_generation.emdb.download_folder)
-            volume = load_aspire_volume(map_path, downsample_size=settings.data_generation.downsample_size)
+            volume = load_aspire_volume(emdb_file, downsample_size=settings.data_generation.downsample_size)
         except (EOFError, OSError, IOError, Exception) as e:
             print(f"Error loading EMDB {emdb_id}: {type(e).__name__}: {e}")
             print(f"Skipping EMDB {emdb_id} due to corrupted or invalid file")
             continue
-
+        if use_precomputed:
+            zarr_path = os.path.join(precomputed_folder, f"{emdb_id}.zarr")
+            try:
+                pre_z = zarr.open(zarr_path, mode='r')
+            except Exception as e:
+                print(f"Error opening precomputed data for EMDB {emdb_id}: {e}")
+                continue
+            # Expect arrays: first_moments (n_q, L, L), eigen_images (n_q, L^2, k), eigen_values (n_q, k)
+            first_moments_arr = pre_z['first_moments']          # shape (n_q, L, L)
+            eigen_images_arr = pre_z['eigen_images']             # shape (n_q, L^2, k)
+            eigen_values_arr = pre_z['eigen_values']             # shape (n_q, k)
+            n_pixels = eigen_images_arr.shape[1]
+            data_type = eigen_images_arr.dtype
+            torch_data_type = torch.float64 if data_type == np.float64 else torch.float32
+            M_arr = np.zeros((n_quadrature, n_pixels, n_pixels), dtype=data_type)
+            for qp in tqdm(range(n_quadrature), desc=f"Extracting second moment components for {emdb_id}", leave=False):
+                U = torch.tensor(eigen_images_arr[qp], dtype=torch_data_type, device=device)  # (n_pixels, k)
+                lam = torch.tensor(eigen_values_arr[qp], dtype=torch_data_type, device=device)     # (k,)
+                if U.size == 0 or lam.size == 0:
+                    raise ValueError(f"Empty eigen images or values for quadrature point {qp} in EMDB {emdb_id}")
+                # Reconstruct second moment matrix for quadrature point from truncated eigendecomposition
+                M_i = (U * lam[None, :]) @ U.T  # (n_pixels, n_pixels)
+                M_arr[qp] = M_i.cpu().numpy()
+                # Load part of M_arr into memory
+            print("Shape of M_arr:", M_arr.shape)
         for i in tqdm(range(num_mixtures_per_volume), desc=f"Mixtures for {emdb_id}", leave=False):
-            # Sample vMF mixture
-            mu, kappa, weights = generate_random_von_mises_fisher_parameters(
-                settings.data_generation.von_mises_fisher.num_distributions,
-                settings.data_generation.von_mises_fisher.kappa_start,
-                settings.data_generation.von_mises_fisher.kappa_mean)
-            mixture_eval = evaluate_von_mises_fisher_mixture(quadrature_points, mu, kappa, weights)
-            # Create SO(3) distribution
-            rotations, distribution = create_in_plane_invariant_distribution(
-                mu, weights, num_in_plane_rotations=settings.data_generation.von_mises_fisher.num_in_plane_rotations)
-            # Build VDM
-            vdm = VolumeDistributionModel(volume, rotations, distribution, distribution_metadata={
-                "type": "vmf_mixture",
-                "means": mu,
-                "kappas": kappa,
-                "weights": weights
-            })
-            # Compute moments
-            first_moment = vdm.first_analytical_moment()
-            second_moment = vdm.second_analytical_moment(batch_size=200)
+            if use_precomputed:  
+                # Sample vMF mixture
+                mu, kappa, weights = generate_random_vmf_parameters(
+                    settings.data_generation.von_mises_fisher.num_distributions,
+                    settings.data_generation.von_mises_fisher.kappa_start,
+                    settings.data_generation.von_mises_fisher.kappa_mean)
+                mixture_eval = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
+
+                # Compute weighted first and second moments
+                first_moment = np.tensordot(mixture_eval, first_moments_arr[0:n_quadrature], axes=(0,0))
+                second_moment = np.tensordot(mixture_eval, M_arr, axes=(0, 0))
+                L = int(np.sqrt(n_pixels))
+                second_moment = second_moment.reshape(L, L, L, L) 
+                                
+            else:
+                # Sample vMF mixture
+                mu, kappa, weights = generate_random_vmf_parameters(
+                    settings.data_generation.von_mises_fisher.num_distributions,
+                    settings.data_generation.von_mises_fisher.kappa_start,
+                    settings.data_generation.von_mises_fisher.kappa_mean)
+                mixture_eval = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
+                # Create SO(3) distribution
+                rotations, distribution = create_in_plane_invariant_distribution(quadrature_points, mixture_eval, 
+                    num_in_plane_rotations=settings.data_generation.in_plane_invariant_distributions.num_in_plane_rotations)
+                vdm = VolumeDistributionModel(volume, rotations, distribution, distribution_metadata={
+                    "type": "vmf_mixture",
+                    "means": mu,
+                    "kappas": kappa,
+                    "weights": weights
+                })
+                # Compute moments
+                first_moment = vdm.first_analytical_moment()
+                second_moment = vdm.second_analytical_moment(batch_size=50, show_progress=True)
+
             # Spectral decomposition (full)
-            eigvals, eigvecs = compute_second_moment_eigendecomposition(second_moment, device=device)
-            L = second_moment.shape[0]
-            total_energy = np.trace(second_moment.reshape(L*L, L*L))
-            # Compute cumulative energy and keep only significant eigenvectors/values
-            cum_energy = np.cumsum(eigvals) / total_energy
-            n_keep = np.searchsorted(cum_energy, 1 - settings.data_generation.second_moment_eigen_energy_dismiss_fraction) + 1
+            eigvals, eigvecs = compute_second_moment_eigendecomposition(second_moment)
+            n_keep = num_components_for_energy_threshold(eigvals, settings.data_generation.second_moment_energy_truncation_threshold)
+            
             if i == 0:
                 print(f"EMDB {emdb_id}: n_keep for first mixture = {n_keep}")
+            # if settings.data_generation.separate_fourier_modes:
+
             eigvals_keep = eigvals[:n_keep]
             eigvecs_keep = eigvecs[:, :n_keep]
+
+            if separate_fourier_modes:
+                compressed_eigenspaces = extract_dominant_eigenvector_modes(eigvecs_keep)
+                # Store each field separately for later stacking
+                all_eigen_radial_profiles.append(np.array([d['radial_profile'] for d in compressed_eigenspaces]).T)
+                all_eigen_m_detected.append(np.array([d['m_detected'] for d in compressed_eigenspaces], dtype=np.int32))
+                all_eigen_energy_fractions.append(np.array([d['energy_fraction'] for d in compressed_eigenspaces]))
+            else:
+                all_eigen_images.append(eigvecs_keep)
             all_means.append(mu)
             all_kappas.append(kappa)
             all_weights.append(weights)
-            all_eigen_images.append(eigvecs_keep)
             all_eigen_values.append(eigvals_keep)
             all_first_moments.append(first_moment)
             all_volume_ids.append(emdb_id)
@@ -101,29 +158,43 @@ def main():
 
             # Periodic save and append
             if total_samples % save_interval == 0:
-                print(f"Reached {total_samples} samples, saving to Zarr...")
-                _flush_to_zarr(
-                    root, all_means, all_kappas, all_weights, all_eigen_images,
-                    all_eigen_values, all_first_moments, all_volume_ids,
-                    all_distribution_evaluations
-                )
+                data_dict = {
+                        "s2_distribution_means": all_means,
+                        "s2_distribution_kappas": all_kappas,
+                        "s2_distribution_weights": all_weights,
+                        "eigen_values": all_eigen_values,
+                        "first_moments": all_first_moments,
+                        "volume_ids": all_volume_ids,
+                        "distribution_evaluations": all_distribution_evaluations,
+                }
+                if separate_fourier_modes:
+                    data_dict.update({
+                        "eigen_radial_profiles": all_eigen_radial_profiles,
+                        "eigen_m_detected": all_eigen_m_detected,
+                        "eigen_energy_fractions": all_eigen_energy_fractions,
+                    })
+                else:
+                    data_dict.update({"eigen_images": all_eigen_images})
+                _flush_to_zarr(root, data_dict)
+
+                if separate_fourier_modes:
+                    all_eigen_radial_profiles.clear()
+                    all_eigen_m_detected.clear()
+                    all_eigen_energy_fractions.clear()
+                else:
+                    all_eigen_images.clear()
                 all_means.clear()
                 all_kappas.clear()
                 all_weights.clear()
-                all_eigen_images.clear()
                 all_eigen_values.clear()
                 all_first_moments.clear()
                 all_volume_ids.clear()
                 all_distribution_evaluations.clear()
 
-    # Final flush for any remaining samples
-    if all_means:
-        print(f"Final flush: saving remaining {len(all_means)} samples to Zarr...")
-        _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, all_eigen_values, all_first_moments, all_volume_ids, all_distribution_evaluations)
-        print(f"Saved {total_samples} samples from {len(emdb_ids)} volumes to {save_path}")
-
-
-def _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, all_eigen_values, all_first_moments, all_volume_ids, all_distribution_evaluations):
+def _flush_to_zarr(
+    root,
+    data_dict,
+):
     def pad_or_cut(arr, n_eigen_target):
         arr = np.asarray(arr)
         if arr.ndim == 1:
@@ -143,16 +214,12 @@ def _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, a
     n_eigen_target = settings.data_generation.max_eigen_vector_save_amount
     # Pad eigen arrays to max save amount
     # Always pad/cut eigen_images to [image_dim, max_amount] and eigen_values to [max_amount]
-    eigen_images_arr = np.stack([pad_or_cut(e, n_eigen_target) for e in all_eigen_images])
-    eigen_values_arr = np.stack([pad_or_cut(ev, n_eigen_target) for ev in all_eigen_values])
-    # Stack first moments
-    first_moments_arr = np.stack(all_first_moments)
-    # Stack other arrays
-    means_arr = np.stack(all_means)
-    kappas_arr = np.stack(all_kappas)
-    weights_arr = np.stack(all_weights)
-    volume_ids_arr = np.array(all_volume_ids)
-    distribution_evaluations_arr = np.stack(all_distribution_evaluations)
+    arrays_to_save = {}
+    for key, arr_list in data_dict.items():
+        if key.startswith("eigen_"):
+            arrays_to_save[key] = np.stack([pad_or_cut(e, n_eigen_target) for e in arr_list])
+        else:
+            arrays_to_save[key] = np.stack(arr_list) if isinstance(arr_list[0], (np.ndarray, list)) else np.array(arr_list)
 
     # If datasets do not exist, create them; else, append
     def append_or_create(name, arr, axis=0):
@@ -168,15 +235,8 @@ def _flush_to_zarr(root, all_means, all_kappas, all_weights, all_eigen_images, a
             )
         zarr_arr = root[name]
         zarr_arr.append(arr, axis=axis)
-    append_or_create("s2_distribution_means", means_arr)
-    append_or_create("s2_distribution_kappas", kappas_arr)
-    append_or_create("s2_distribution_weights", weights_arr)
-    append_or_create("eigen_images", eigen_images_arr)
-    append_or_create("eigen_values", eigen_values_arr)
-    append_or_create("first_moments", first_moments_arr)
-    append_or_create("volume_ids", volume_ids_arr)
-    append_or_create("distribution_evaluations", distribution_evaluations_arr)
-
+    for key, arr in arrays_to_save.items():
+        append_or_create(key, arr)
 
 if __name__ == "__main__":
     main()
