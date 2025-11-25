@@ -48,11 +48,12 @@ class VolumeDistributionModel:
     """
 
     def __init__(self, volume: Volume, rotations: Rotation, distribution: np.ndarray, 
-                 distribution_metadata=None, in_plane_invariant_distribution=False):
+                 distribution_metadata=None, fourier_domain=False, in_plane_invariant_distribution=False):
         self.volume = volume
         self.rotations = rotations
         self.distribution = self.normalize_distribution(distribution)
         self.in_plane_invariant_distribution = in_plane_invariant_distribution
+        self.fourier_domain = fourier_domain
         # Store general distribution metadata (must be a dict with a 'type' key)
         if distribution_metadata is not None:
             if not isinstance(distribution_metadata, dict):
@@ -184,6 +185,8 @@ class VolumeDistributionModel:
         projections = self.volume.project(rotations_to_project).asnumpy()
         noise = np.random.normal(0, sigma, projections.shape)
         projections = projections + noise
+        if self.fourier_domain:
+            projections = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(projections, axes=(-2, -1)), norm='ortho'), axes=(-2, -1))   
         if not return_used_rotations:
             return projections
         else:
@@ -210,6 +213,8 @@ class VolumeDistributionModel:
             The computed first analytical moment.
         """
         weights = self.distribution
+        if self.fourier_domain:
+            dtype = torch.complex128 if dtype == torch.float64 else torch.complex64
 
         if not self.in_plane_invariant_distribution:
             if settings.device.use_cuda:
@@ -278,8 +283,11 @@ class VolumeDistributionModel:
             device = f"cuda:{settings.device.cuda_device}"
         else:
             device = "cpu"
+        if self.fourier_domain:
+            dtype = torch.complex128 if dtype == torch.float64 else torch.complex64
         second_moment = torch.zeros((L, L, L, L), dtype=dtype, device=device)
-        projections = self.volume.project(self.rotations).asnumpy().copy()  # shape: (N, L, L), ensure writeable
+        projections = self.generate_projections(self.rotations)
+        # projections = self.volume.project(self.rotations).asnumpy().copy()  # shape: (N, L, L), ensure writeable
         projections_t = torch.from_numpy(projections).to(device=device, dtype=dtype)
         weights_t = torch.from_numpy(self.distribution).to(device=device, dtype=dtype)
 
@@ -291,7 +299,10 @@ class VolumeDistributionModel:
             batch_projs = projections_t[start_idx:end_idx]  # (B, L, L)
             batch_weights = weights_t[start_idx:end_idx]  # (B,)
             # Compute weighted outer products for this batch
-            outer = torch.einsum('bij,bkl->bijkl', batch_projs, batch_projs)
+            if self.fourier_domain:
+                outer = torch.einsum('bij,bkl->bijkl', batch_projs, batch_projs.conj())
+            else:
+                outer = torch.einsum('bij,bkl->bijkl', batch_projs, batch_projs)
             weighted_outer = batch_weights[:, None, None, None, None] * outer
             second_moment += torch.sum(weighted_outer, dim=0)
         return second_moment.cpu().numpy()

@@ -31,7 +31,6 @@ def main():
     # Generate quadrature points once
     n_quadrature = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
     quadrature_points = fibonacci_sphere_points(n_quadrature)
-    use_precomputed = settings.data_generation.use_precomputed_delta_moments
     separate_fourier_modes = settings.data_generation.separate_fourier_modes
     # Preallocate lists for all samples (to be periodically flushed)
     all_means = []
@@ -52,99 +51,127 @@ def main():
     emdb_folder = settings.data_generation.emdb.download_folder
     emdb_files = [os.path.join(emdb_folder, f) for f in os.listdir(emdb_folder) if f.endswith('.map.gz')]
     np.random.shuffle(emdb_files)
-    if use_precomputed:
-        precomputed_folder = "/data/shachar/zarr_files/emdb_in_plane_invariant_moment_subspace_components"
+    precomputed_folder = "/data/shachar/zarr_files/emdb_in_plane_invariant_moment_subspace_components"
 
     num_mixtures_per_volume = settings.data_generation.von_mises_fisher.num_generated_examples_per_volume
     print("number of mixtures per volume:", num_mixtures_per_volume)
     for emdb_file in tqdm(emdb_files, desc="EMDB Volumes"):
-        emdb_id = os.path.basename(emdb_file).split('.')[0] 
+        emdb_id = os.path.basename(emdb_file).split('.')[0]
 
-        # Download map and load as aspire Volume
+        emdb_id = "emd_52988"
+
         print(f"Processing EMDB {emdb_id}")
+        zarr_path = os.path.join(precomputed_folder, f"{emdb_id}.zarr")
         try:
-            volume = load_aspire_volume(emdb_file, downsample_size=settings.data_generation.downsample_size)
-        except (EOFError, OSError, IOError, Exception) as e:
-            print(f"Error loading EMDB {emdb_id}: {type(e).__name__}: {e}")
-            print(f"Skipping EMDB {emdb_id} due to corrupted or invalid file")
+            pre_z = zarr.open(zarr_path, mode='r')
+        except Exception as e:
+            print(f"Error opening precomputed data for EMDB {emdb_id}: {e}")
             continue
-        if use_precomputed:
-            zarr_path = os.path.join(precomputed_folder, f"{emdb_id}.zarr")
-            try:
-                pre_z = zarr.open(zarr_path, mode='r')
-            except Exception as e:
-                print(f"Error opening precomputed data for EMDB {emdb_id}: {e}")
-                continue
-            # Expect arrays: first_moments (n_q, L, L), eigen_images (n_q, L^2, k), eigen_values (n_q, k)
-            first_moments_arr = pre_z['first_moments']          # shape (n_q, L, L)
-            eigen_images_arr = pre_z['eigen_images']             # shape (n_q, L^2, k)
-            eigen_values_arr = pre_z['eigen_values']             # shape (n_q, k)
-            n_pixels = eigen_images_arr.shape[1]
-            data_type = eigen_images_arr.dtype
-            torch_data_type = torch.float64 if data_type == np.float64 else torch.float32
-            M_arr = np.zeros((n_quadrature, n_pixels, n_pixels), dtype=data_type)
-            for qp in tqdm(range(n_quadrature), desc=f"Extracting second moment components for {emdb_id}", leave=False):
-                U = torch.tensor(eigen_images_arr[qp], dtype=torch_data_type, device=device)  # (n_pixels, k)
-                lam = torch.tensor(eigen_values_arr[qp], dtype=torch_data_type, device=device)     # (k,)
-                if U.size == 0 or lam.size == 0:
-                    raise ValueError(f"Empty eigen images or values for quadrature point {qp} in EMDB {emdb_id}")
-                # Reconstruct second moment matrix for quadrature point from truncated eigendecomposition
-                M_i = (U * lam[None, :]) @ U.T  # (n_pixels, n_pixels)
-                M_arr[qp] = M_i.cpu().numpy()
-                # Load part of M_arr into memory
-            print("Shape of M_arr:", M_arr.shape)
-        for i in tqdm(range(num_mixtures_per_volume), desc=f"Mixtures for {emdb_id}", leave=False):
-            if use_precomputed:  
-                # Sample vMF mixture
+        # Expect arrays: first_moments (n_q, L, L), eigen_images (n_q, L^2, k), eigen_values (n_q, k)
+        first_moments_arr = pre_z['first_moments']          # shape (n_q, L, L)
+        eigen_images_arr = pre_z['eigen_images']             # shape (n_q, L^2, k)
+        eigen_values_arr = pre_z['eigen_values']             # shape (n_q, k)
+        n_pixels = eigen_images_arr.shape[1]
+        data_type = eigen_images_arr.dtype
+        torch_data_type = torch.float64 if data_type == np.float64 else torch.float32
+        M_arr = np.zeros((n_quadrature, n_pixels, n_pixels), dtype=data_type)
+        for qp in tqdm(range(n_quadrature), desc=f"Extracting second moment components for {emdb_id}", leave=False):
+            U = torch.tensor(eigen_images_arr[qp], dtype=torch_data_type, device=device)  # (n_pixels, k)
+            lam = torch.tensor(eigen_values_arr[qp], dtype=torch_data_type, device=device)     # (k,)
+            if U.size == 0 or lam.size == 0:
+                raise ValueError(f"Empty eigen images or values for quadrature point {qp} in EMDB {emdb_id}")
+            # Reconstruct second moment matrix for quadrature point from truncated eigendecomposition
+            M_i = (U * lam[None, :]) @ U.T  # (n_pixels, n_pixels)
+            M_arr[qp] = M_i.cpu().numpy()
+
+        if emdb_id in root:
+            volume_group = root[emdb_id]
+        else:
+            volume_group = None
+        if volume_group is None:
+            # Dynamically determine n_eigen_target
+            n_probe = 15
+            n_keep_list = []
+            for _ in range(n_probe):
+                # Generate random mixtures, compute second moments, and determine n_keep
                 mu, kappa, weights = generate_random_vmf_parameters(
                     settings.data_generation.von_mises_fisher.num_distributions,
                     settings.data_generation.von_mises_fisher.kappa_start,
                     settings.data_generation.von_mises_fisher.kappa_mean)
                 mixture_eval = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
-
-                # Compute weighted first and second moments
-                first_moment = np.tensordot(mixture_eval, first_moments_arr[0:n_quadrature], axes=(0,0))
                 second_moment = np.tensordot(mixture_eval, M_arr, axes=(0, 0))
                 L = int(np.sqrt(n_pixels))
                 second_moment = second_moment.reshape(L, L, L, L) 
-                                
-            else:
-                # Sample vMF mixture
-                mu, kappa, weights = generate_random_vmf_parameters(
-                    settings.data_generation.von_mises_fisher.num_distributions,
-                    settings.data_generation.von_mises_fisher.kappa_start,
-                    settings.data_generation.von_mises_fisher.kappa_mean)
-                mixture_eval = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
-                # Create SO(3) distribution
-                rotations, distribution = create_in_plane_invariant_distribution(quadrature_points, mixture_eval, 
-                    num_in_plane_rotations=settings.data_generation.in_plane_invariant_distributions.num_in_plane_rotations)
-                vdm = VolumeDistributionModel(volume, rotations, distribution, distribution_metadata={
-                    "type": "vmf_mixture",
-                    "means": mu,
-                    "kappas": kappa,
-                    "weights": weights
-                })
-                # Compute moments
-                first_moment = vdm.first_analytical_moment()
-                second_moment = vdm.second_analytical_moment(batch_size=50, show_progress=True)
+                eigvals, _ = compute_second_moment_eigendecomposition(second_moment)
+                n_keep = num_components_for_energy_threshold(eigvals, settings.data_generation.second_moment_energy_truncation_threshold)
+                n_keep_list.append(n_keep)
+
+                emdb_id = "emd_52988"
+                emdb_path = f"/data/shachar/emdb_downloads/{emdb_id}.map.gz"
+                volume = load_aspire_volume(emdb_path, downsample_size=settings.data_generation.downsample_size)
+                volume = volume.downsample(settings.data_generation.downsample_size)
+                so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, mixture_eval, 
+                                                                                        num_in_plane_rotations=200)
+                vdm = VolumeDistributionModel(volume, rotations=so3_rotations, distribution=so3_weights, fourier_domain=False)
+                new_second_moment = vdm.second_analytical_moment(
+                                        batch_size=50, 
+                                        show_progress=True
+                                    )
+                eigvals_new, _ = compute_second_moment_eigendecomposition(new_second_moment)
+                n_keep_new = num_components_for_energy_threshold(eigvals_new, settings.data_generation.second_moment_energy_truncation_threshold)
+                print(f"Probe n_keep: {n_keep}, n_keep_new: {n_keep_new}")
+                print(f"Second moment difference norm: {np.linalg.norm(second_moment - new_second_moment)}")
+
+
+            n_eigen_target = int(max(n_keep_list) * 1.1) # Add 10% buffer
+            print(f"Determined n_eigen_target for {emdb_id}: {n_eigen_target}")
+            volume_group = root.require_group(emdb_id)
+            volume_group.attrs['n_eigen_target'] = n_eigen_target  # Save for future reference
+        else:
+            n_eigen_target = volume_group["eigen_values"].shape[-1]
+            print(f"Loaded n_eigen_target for {emdb_id}: {n_eigen_target}")
+
+        for i in tqdm(range(num_mixtures_per_volume), desc=f"Mixtures for {emdb_id}", leave=False):
+            # Sample vMF mixture
+            mu, kappa, weights = generate_random_vmf_parameters(
+                settings.data_generation.von_mises_fisher.num_distributions,
+                settings.data_generation.von_mises_fisher.kappa_start,
+                settings.data_generation.von_mises_fisher.kappa_mean)
+            mixture_eval = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
+
+            # Compute weighted first and second moments
+            first_moment = np.tensordot(mixture_eval, first_moments_arr[0:n_quadrature], axes=(0,0))
+            second_moment = np.tensordot(mixture_eval, M_arr, axes=(0, 0))
+            L = int(np.sqrt(n_pixels))
+            second_moment = second_moment.reshape(L, L, L, L) 
 
             # Spectral decomposition (full)
             eigvals, eigvecs = compute_second_moment_eigendecomposition(second_moment)
-            n_keep = num_components_for_energy_threshold(eigvals, settings.data_generation.second_moment_energy_truncation_threshold)
-            
-            if i == 0:
-                print(f"EMDB {emdb_id}: n_keep for first mixture = {n_keep}")
-            # if settings.data_generation.separate_fourier_modes:
-
-            eigvals_keep = eigvals[:n_keep]
-            eigvecs_keep = eigvecs[:, :n_keep]
+            eigvals_keep = eigvals[:n_eigen_target]
+            eigvecs_keep = eigvecs[:, :n_eigen_target]
 
             if separate_fourier_modes:
                 compressed_eigenspaces = extract_dominant_eigenvector_modes(eigvecs_keep)
-                # Store each field separately for later stacking
-                all_eigen_radial_profiles.append(np.array([d['radial_profile'] for d in compressed_eigenspaces]).T)
+                # Determine radial profile length from first eigenvector
+                if compressed_eigenspaces[0]['m_detected'] == 0:
+                    len_r = compressed_eigenspaces[0]['radial_profile'].shape[0]
+                    data_type = compressed_eigenspaces[0]['radial_profile'].dtype
+                else:
+                    len_r = compressed_eigenspaces[0]['cos_component'].shape[0]
+                    data_type = compressed_eigenspaces[0]['cos_component'].dtype
                 all_eigen_m_detected.append(np.array([d['m_detected'] for d in compressed_eigenspaces], dtype=np.int32))
                 all_eigen_energy_fractions.append(np.array([d['energy_fraction'] for d in compressed_eigenspaces]))
+
+                # Collect radial profiles for all eigenvectors in this sample
+                radial_profiles = np.zeros((2 * len_r, len(compressed_eigenspaces)), dtype=data_type)
+                for j, d in enumerate(compressed_eigenspaces):
+                    if d['m_detected'] == 0:
+                        radial_profiles[:len_r, j] = d['radial_profile']
+                        radial_profiles[len_r:, j] = 0  # pad sin component with zeros
+                    else:
+                        radial_profiles[:len_r, j] = d['cos_component']
+                        radial_profiles[len_r:, j] = d['sin_component']
+                all_eigen_radial_profiles.append(radial_profiles)
             else:
                 all_eigen_images.append(eigvecs_keep)
             all_means.append(mu)
@@ -175,7 +202,7 @@ def main():
                     })
                 else:
                     data_dict.update({"eigen_images": all_eigen_images})
-                _flush_to_zarr(root, data_dict)
+                _flush_to_zarr(volume_group, data_dict)
 
                 if separate_fourier_modes:
                     all_eigen_radial_profiles.clear()
@@ -192,7 +219,7 @@ def main():
                 all_distribution_evaluations.clear()
 
 def _flush_to_zarr(
-    root,
+    group,
     data_dict,
 ):
     def pad_or_cut(arr, n_eigen_target):
@@ -211,9 +238,8 @@ def _flush_to_zarr(
         else:
             raise ValueError("pad_or_cut only supports 1D or 2D arrays")
     # Convert lists to arrays (padding eigenvectors/values if needed)
-    n_eigen_target = settings.data_generation.max_eigen_vector_save_amount
     # Pad eigen arrays to max save amount
-    # Always pad/cut eigen_images to [image_dim, max_amount] and eigen_values to [max_amount]
+    n_eigen_target = group.attrs.get('n_eigen_target')
     arrays_to_save = {}
     for key, arr_list in data_dict.items():
         if key.startswith("eigen_"):
@@ -222,10 +248,10 @@ def _flush_to_zarr(
             arrays_to_save[key] = np.stack(arr_list) if isinstance(arr_list[0], (np.ndarray, list)) else np.array(arr_list)
 
     # If datasets do not exist, create them; else, append
-    def append_or_create(name, arr, axis=0):
+    def append_or_create(group, name, arr, axis=0):
         chunks = (min(100, arr.shape[0]),) + arr.shape[1:]
-        if name not in root:
-            root.create_array(
+        if name not in group:
+            group.create_array(
                 name,
                 shape=(0,) + arr.shape[1:],
                 chunks=chunks,
@@ -233,10 +259,11 @@ def _flush_to_zarr(
                 overwrite=False,
                 fill_value=0
             )
-        zarr_arr = root[name]
+        zarr_arr = group[name]
         zarr_arr.append(arr, axis=axis)
+        
     for key, arr in arrays_to_save.items():
-        append_or_create(key, arr)
+        append_or_create(group, key, arr)
 
 if __name__ == "__main__":
     main()

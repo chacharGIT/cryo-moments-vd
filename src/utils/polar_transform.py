@@ -1,5 +1,7 @@
 import numpy as np
+from scipy import linalg
 from scipy.ndimage import map_coordinates
+from scipy.interpolate import CubicSpline
 from config.config import settings
 
 def cartesian_to_polar(cartesian_image, n_theta=settings.data_generation.cartesian_to_polar_n_theta,
@@ -96,9 +98,9 @@ def polar_to_cartesian(polar_image, r_vals, n_theta=settings.data_generation.car
     cartesian_image = cartesian_image.reshape(output_shape)
     return cartesian_image
 
-def remove_global_phase(radial_vector: np.ndarray) -> np.ndarray:
+def average_global_phase(radial_vector: np.ndarray, r_vals: np.ndarray):
     """
-    Remove global phase from a complex radial vector so its sum is real and positive.
+    Compute the average global phase of a complex radial vector.
 
     Parameters
     ----------
@@ -107,16 +109,17 @@ def remove_global_phase(radial_vector: np.ndarray) -> np.ndarray:
 
     Returns
     -------
-    radial_vector_real : ndarray
-        1D real array with global phase removed.
+    phase : float
+        The phase angle (in radians) of the sum of the vector.
     """
-    phase = np.angle(np.sum(radial_vector))
-    radial_real = np.real(radial_vector * np.exp(-1j * phase))
-    if np.sum(radial_real) < 0:
-        radial_real = -radial_real
-    return radial_real
+    weights = np.abs(radial_vector)**2 * r_vals
+    integrand = radial_vector * weights
+    cs = CubicSpline(r_vals, integrand)
+    I = cs.integrate(r_vals[0], r_vals[-1])
+    phase = np.arctan2(np.imag(I), np.real(I))
+    return phase
 
-def extract_dominant_angular_fourier_mode(polar_image: np.ndarray):
+def extract_dominant_angular_fourier_mode(polar_image: np.ndarray, r_vals: np.ndarray):
     """
     For a real polar image, find the angular mode m for which the sum of energies of
     plus/minus m Fourier components is maximal. For both +m and -m, extract the radial
@@ -125,16 +128,17 @@ def extract_dominant_angular_fourier_mode(polar_image: np.ndarray):
     Parameters
     ----------
     polar_image : ndarray
-        2D real array of shape (num_r, num_theta).
+        2D real array of shape (num_r, num_theta), representing the image in polar coordinates.
 
     Returns
     -------
     m_detected : int
-        Detected angular frequency m.
-    radial_profile : ndarray
-        1D array (num_r,) averaged from +m and -m components, global phase removed.
+        Detected dominant angular frequency (mode).
+    radial_profile : ndarray or list of ndarray
+        For m=0: 1D real array (num_r,) representing the radial profile.
+        For m>0: list of two 1D real arrays (num_r,) representing the cosine and sine quadratures.
     energy_fraction : float
-        Fraction of total energy in the detected modes.
+        Fraction of total energy contained in the detected mode.
     """
     num_r, num_theta = polar_image.shape
     fft_coeffs = np.fft.fft(polar_image, axis=1)
@@ -153,63 +157,42 @@ def extract_dominant_angular_fourier_mode(polar_image: np.ndarray):
 
     m_detected = np.argmax(energies)
     if m_detected == 0:
-        radial_profile = remove_global_phase(fft_coeffs[:, 0])
+        radial_profile = np.real(fft_coeffs[:, 0])
+        phase = np.angle(np.sum(radial_profile))
+        radial_profile = np.real(radial_profile * np.exp(-1j * phase))
+        if np.sum(radial_profile) < 0:
+            radial_profile = -radial_profile
         energy_fraction = energies[0] / total_energy
-        return 0, radial_profile, energy_fraction
+        integrand = np.abs(radial_profile)**2 * r_vals
+        cs = CubicSpline(r_vals, integrand)
+        norm_squared = 2 * np.pi * cs.integrate(r_vals[0], r_vals[-1])
+        radial_profile /= np.sqrt(norm_squared)
+        return int(0), radial_profile, energy_fraction
     else:
         idx_pos = m_detected
         idx_neg = (-m_detected) % num_theta
-        radial_plus = fft_coeffs[:, idx_pos]
-        radial_minus = fft_coeffs[:, idx_neg]
-        radial_plus_real = remove_global_phase(radial_plus)
-        radial_minus_real = remove_global_phase(radial_minus)
-        radial_profile = (radial_plus_real + radial_minus_real)
-        radial_profile /= np.sum(radial_profile)  # Normalize
+        # Force real data constraint: a(-m) = a(m)*
+        rotated_cos = (fft_coeffs[:, idx_pos] + fft_coeffs[:, idx_neg])/2
+        rotated_sin = (fft_coeffs[:, idx_pos] - fft_coeffs[:, idx_neg])/(2j)
+        radial_plus = rotated_cos + 1j * rotated_sin
+        radial_minus = rotated_cos - 1j * rotated_sin
+        phase = average_global_phase(radial_plus, r_vals)
+        # Align to gauge where both components have same average
+        phase_to_gauge = np.pi/4 - phase
+        radial_plus = radial_plus * np.exp(1j * phase_to_gauge)
+        radial_minus = radial_minus * np.exp(-1j * phase_to_gauge)
+        cos_component = np.real((radial_plus + radial_minus)/2)
+        sin_component = np.real((radial_plus - radial_minus)/(2j))
+        integrand = np.abs(cos_component)**2 * r_vals
+        cs = CubicSpline(r_vals, integrand)
+        norm_squared = np.pi * cs.integrate(r_vals[0], r_vals[-1])
+        integrand = np.abs(sin_component)**2 * r_vals
+        cs = CubicSpline(r_vals, integrand)
+        norm_squared += np.pi * cs.integrate(r_vals[0], r_vals[-1])
+        cos_component /= np.sqrt(norm_squared)
+        sin_component /= np.sqrt(norm_squared)
         energy_fraction = energies[m_detected] / total_energy
-        return m_detected, radial_profile, energy_fraction
-
-def extract_dominant_angular_fourier_mode_deprecated(polar_image: np.ndarray):
-    """
-    Detect the dominant angular frequency m in a complex polar image using FFT along the angular axis.
-    If the input is real, returns the radial average.
-
-    Parameters
-    ----------
-    polar_image : ndarray
-        2D array of shape (num_r, num_theta) representing the polar image.
-
-    Returns
-    -------
-    m_detected : int
-        Detected angular frequency m.
-    radial_profile : ndarray
-        1D array (num_r,) of the real part of the FFT component for m_detected, phase-corrected,
-        or the radial average if the input is real.
-    energy_fraction : float, optional
-        Fraction of total energy in the detected mode. Returns 1.0 if input is real.
-    """
-    _ , num_theta = polar_image.shape
-    if np.isrealobj(polar_image):
-        radial_profile = np.mean(polar_image, axis=1)
-        return 0, radial_profile, 1.0
-    else:
-        fft_coeffs = np.fft.fft(polar_image, axis=1)
-        spectrum = np.sum(np.abs(fft_coeffs), axis=0)
-        # Find the frequency with the largest magnitude (excluding DC if desired)
-        m_detected = np.argmax(spectrum)
-        # For negative frequencies (if needed)
-        if m_detected > num_theta // 2:
-            m_detected -= num_theta
-
-        idx_detected = m_detected
-        energy_m = np.sum(np.abs(fft_coeffs[:, idx_detected])**2)
-        total_energy = np.sum(np.abs(fft_coeffs)**2)
-        energy_fraction = energy_m / total_energy
-
-        radial_fft_component = fft_coeffs[:, m_detected]
-        global_phase = np.angle(np.sum(np.abs(radial_fft_component)**2 * radial_fft_component))
-        radial_profile = np.real(radial_fft_component * np.exp(-1j * global_phase))
-        return m_detected, radial_profile, energy_fraction
+        return m_detected, [cos_component, sin_component], energy_fraction
 
 if __name__ == "__main__":
     import numpy as np

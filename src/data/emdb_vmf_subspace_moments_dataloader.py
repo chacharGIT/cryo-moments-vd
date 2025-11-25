@@ -39,24 +39,28 @@ class EMDBvMFSubspaceMomentsDataset(Dataset):
         self.zarr_path = zarr_path
         self.transform = transform
         self.root = zarr.open(zarr_path, mode='r')
+        self.volume_ids = list(self.root.group_keys())
         # Get dataset length from any of the arrays
-        self.length = self.root['s2_distribution_means'].shape[0]
-        self.shapes = {
-            's2_distribution_means': self.root['s2_distribution_means'].shape[1:],
-            's2_distribution_kappas': self.root['s2_distribution_kappas'].shape[1:],
-            's2_distribution_weights': self.root['s2_distribution_weights'].shape[1:],
-            'eigen_images': self.root['eigen_images'].shape[1:],
-            'eigen_values': self.root['eigen_values'].shape[1:],
-            'first_moments': self.root['first_moments'].shape[1:],
-            'distribution_evaluations': self.root['distribution_evaluations'].shape[1:]
-        }
+        self.volume_sample_counts = {}
+        self.volume_shapes = {}
+        for vid in self.volume_ids:
+            group = self.root[vid]
+            self.volume_sample_counts[vid] = group['s2_distribution_means'].shape[0]
+            self.volume_shapes[vid] = {key: group[key].shape[1:] for key in group.array_keys()}
+
+        # Build flat index mapping (freeze state at init)
+        self.flat_indices = []
+        for vid in self.volume_ids:
+            n = self.volume_sample_counts[vid]
+            for i in range(n):
+                self.flat_indices.append((vid, i))
+        self.length = len(self.flat_indices)
+
         if debug:
-            print(f"Loaded EMDB vMF subspace moments dataset with {self.length} samples")
-            print(f"Sample shapes: {self.shapes}")
-            print(f"Chunk size: {self.root['s2_distribution_means'].chunks[0]}")
-            print("Zarr array shapes for debug:")
-            for key in self.root.array_keys():
-                print(f"  {key}: {self.root[key].shape}")
+            first_volume_id = self.volume_ids[0]
+            print(f"First EMDB volume {first_volume_id} with {self.volume_sample_counts[first_volume_id]} samples")
+            print(f"First volume sample shapes: {self.volume_shapes[first_volume_id]}")
+            print(f"Chunk size: {self.root[first_volume_id]['s2_distribution_means'].chunks[0]}")
     
     def __len__(self) -> int:
         return self.length
@@ -75,26 +79,26 @@ class EMDBvMFSubspaceMomentsDataset(Dataset):
             indices = [int(i) for i in indices]
         else:
             raise TypeError(f"__getitem__ expects a single int or a list/array of integers, got: {indices}")
+        
+        resolved = [self.flat_indices[i] for i in indices]
         tensor_fields = [
             's2_distribution_means', 's2_distribution_kappas', 's2_distribution_weights',
             'eigen_images', 'eigen_values', 'first_moments', 'distribution_evaluations'
         ]
-        # Ensure indices are a plain list of ints
-        indices = [int(i) for i in indices]
         batch = {}
         for key in tensor_fields:
-            batch_data = self.root[key][indices]
+            samples = []
+            for vid, sidx in resolved:
+                samples.append(self.root[vid][key][sidx])
+            batch_data = np.stack(samples, axis=0)
             batch[key] = torch.from_numpy(np.ascontiguousarray(batch_data)).float()
-        batch['volume_id'] = [self.root['volume_ids'][i] for i in indices]
+        batch['volume_id'] = [vid for vid, _ in resolved]
 
-        # --- Normalize first moments by L1 norm per sample ---
+        # Normalize first moments by L1 norm per sample
         epsilon = 1e-8
-        first_moments = batch['first_moments']  # shape: [B, ...]
-        # Compute L1 norm for each sample in batch
+        first_moments = batch['first_moments']
         norms = first_moments.view(first_moments.shape[0], -1).abs().sum(dim=1, keepdim=True)  # [B, 1]
-        # Avoid division by zero
         norms = norms + epsilon
-        # Reshape for broadcasting
         norm_shape = [first_moments.shape[0]] + [1] * (first_moments.dim() - 1)
         batch['first_moments'] = first_moments / norms.view(*norm_shape)
         
@@ -111,8 +115,11 @@ class ChunkShuffleIterableDataset(IterableDataset):
         self.shuffle = shuffle
         self.device = device
         zarr_root = dataset.root
-        first_key = next(iter(zarr_root.array_keys()))
-        self.chunk_size = zarr_root[first_key].chunks[0]
+        zarr_root = dataset.root
+        first_volume_id = dataset.volume_ids[0]
+        first_group = zarr_root[first_volume_id]
+        first_key = next(iter(first_group.array_keys()))
+        self.chunk_size = first_group[first_key].chunks[0]
         self.batch_size = batch_size if batch_size is not None else self.chunk_size
 
     def __iter__(self):

@@ -1,3 +1,4 @@
+import enum
 from matplotlib.pylab import f
 import numpy as np
 import torch
@@ -5,9 +6,9 @@ import matplotlib.pyplot as plt
 import os
 from typing import Optional, Union
 
-from zarr import save
 from config.config import settings
 from src.utils.polar_transform import cartesian_to_polar, extract_dominant_angular_fourier_mode
+from src.utils.numpy_torch_conversion import dtype_to_torch
 
 def compute_second_moment_eigendecomposition(second_moment: Union[np.ndarray, torch.Tensor]):
     """
@@ -35,11 +36,13 @@ def compute_second_moment_eigendecomposition(second_moment: Union[np.ndarray, to
         device = f"cuda:{settings.device.cuda_device}"
     else:
         device = "cpu"
+    dtype = second_moment.dtype
+    dtype = dtype_to_torch(dtype) if isinstance(dtype, np.dtype) else dtype
     # Convert to torch tensor if needed
     if isinstance(second_moment, np.ndarray):
-        second_moment_t = torch.from_numpy(second_moment).to(device=device, dtype=torch.float64)
+        second_moment_t = torch.from_numpy(second_moment).to(device=device, dtype=dtype)
     else:
-        second_moment_t = second_moment.to(device=device, dtype=torch.float64)
+        second_moment_t = second_moment.to(device=device, dtype=dtype)
     if second_moment_t.dim() != 4:
         raise ValueError("second_moment must be a 4D tensor (L, L, L, L)")
     L = second_moment_t.shape[0]
@@ -76,7 +79,7 @@ def num_components_for_energy_threshold(eigenvalues: np.ndarray, truncation_thre
 
 def extract_dominant_eigenvector_modes(eigenvectors: np.ndarray):
     """
-    For each eigenvector, extract the dominant angular Fourier mode from its polar image.
+    For each eigenvector, extract the dominant angular Fourier modes from its polar image.
 
     Parameters
     ----------
@@ -88,101 +91,52 @@ def extract_dominant_eigenvector_modes(eigenvectors: np.ndarray):
     Returns
     -------
     compressed_eigenspaces : list of dict
-        Each dict contains:
-            'm_detected': int,
-            'radial_profile': ndarray,
-            'energy_fraction': float
+        For each eigenvector, a dictionary containing:
+            - 'm_detected': int, the detected angular frequency (mode)
+            - 'radial_profile': ndarray (for m=0), the real radial profile
+            - 'cos_component': ndarray (for m>0), the cosine quadrature radial profile
+            - 'sin_component': ndarray (for m>0), the sine quadrature radial profile
+            - 'energy_fraction': float, fraction of total energy in the detected mode
     """
     compressed_eigenspaces = []
     L = int(np.sqrt(eigenvectors.shape[0]))
     for i in range(eigenvectors.shape[1]):
         vec = eigenvectors[:, i]
         polar_image, r_vals, _ = cartesian_to_polar(vec.reshape(L, L))
-        m_detected, radial_profile, energy_fraction = extract_dominant_angular_fourier_mode(polar_image)
-        compressed_eigenspaces.append({
-            'm_detected': int(np.abs(m_detected)),
-            'radial_profile': radial_profile,
-            'energy_fraction': energy_fraction
-        })
-    return compressed_eigenspaces
-
-def extract_dominant_eigenvector_modes_deprecated(eigenvalues: np.ndarray, eigenvectors: np.ndarray, rel_tol: float = 5e-2):
-    """
-    Groups eigenvectors by unique eigenvalues (up to relative tolerance and geometric multiplicity 2).
-    For each eigen space, extracts angular Fourier mode information.
-
-    Parameters
-    ----------
-    eigenvalues : ndarray
-        Array of eigenvalues (sorted in descending order).
-    eigenvectors : ndarray
-        Array of eigenvectors as columns (shape: (L², L²)).
-    rel_tol : float
-        Relative tolerance for considering eigenvalues equal.
-
-    Returns
-    -------
-    compressed_eigenspaces : list of dict
-        Each dict contains 'eigenvalue', 'm_detected', 'radial_profile', and 'energy_fraction'.
-        - 'm_detected': the detected angular frequency (natural number),
-        - 'radial_profile': the radial profile for the dominant mode,
-        - 'energy_fraction': the fraction of energy in the detected mode.
-    """
-    eigenspaces = []
-    used = np.zeros(len(eigenvalues), dtype=bool)
-    for i, val in enumerate(eigenvalues):
-            if used[i]:
-                continue
-            # Find all eigenvalues close to val
-            idx = np.where(np.abs(eigenvalues - val) / (np.abs(val) + 1e-16) < rel_tol)[0]
-            # Only mark as used the ones you actually select
-            if len(idx) > 2:
-                eigvecs = []
-                for j in idx:
-                    if not used[j]:
-                        eigvecs.append(eigenvectors[:, j])
-                        used[j] = True
-                        if len(eigvecs) == 2:
-                            break
-            else:
-                eigvecs = [eigenvectors[:, j] for j in idx]
-                used[idx] = True
-            eigenspaces.append((val, eigvecs))
-
-    compressed_eigenspaces = []
-    for eigenvalue, vectors in eigenspaces:
-        multiplicity = len(vectors)
-
-        if multiplicity == 2:
-            polar_image_0, r_vals, _ = cartesian_to_polar(vectors[0].reshape(int(np.sqrt(eigenvectors.shape[0])), -1))
-            polar_image_1 = cartesian_to_polar(vectors[1].reshape(int(np.sqrt(eigenvectors.shape[0])), -1))[0]
-            m_detected, radial_profile, energy_fraction = extract_dominant_angular_fourier_mode(polar_image_0 + 1j*polar_image_1)
+        m_detected, radial_profile, energy_fraction = extract_dominant_angular_fourier_mode(polar_image, r_vals)
+        if int(m_detected) == 0:
+            compressed_eigenspaces.append({
+                'm_detected': int(m_detected),
+                'radial_profile': radial_profile,
+                'energy_fraction': energy_fraction
+            })
         else:
-            polar_image = cartesian_to_polar(vectors[0].reshape(int(np.sqrt(eigenvectors.shape[0])), -1))[0]
-            m_detected, radial_profile, energy_fraction = extract_dominant_angular_fourier_mode(polar_image)
-        compressed_eigenspaces.append({
-            'eigenvalue': eigenvalue,
-            'm_detected': int(np.abs(m_detected)),
-            'radial_profile': radial_profile,
-            'energy_fraction': energy_fraction
-        })
+            compressed_eigenspaces.append({
+                'm_detected': int(m_detected),
+                'cos_component': radial_profile[0],
+                'sin_component': radial_profile[1],
+                'energy_fraction': energy_fraction
+            })
     return compressed_eigenspaces
 
-def plot_angular_mode(eigenvector: np.ndarray, mode: int, radial_profile: np.ndarray, r_vals: np.ndarray, save_path: str = None):
+def plot_angular_mode(eigenvector: np.ndarray, mode: int, radial_profile: np.ndarray, r_vals: np.ndarray, save_path: str):
     """
-    Plot a 2D image from a radial profile and angular mode using polar_to_cartesian,
-    and also plot the radial profile in the same figure.
+    Plot a 2D image from a radial profile and angular mode using polar_to_cartesian.
+    Plot the radial profile in the same figure.
 
     Parameters
     ----------
+    eigenvector : ndarray
+        The original eigenvector, shape (L²,) or (L, L).
     mode : int
         Angular Fourier mode (m).
-    radial_profile : ndarray
-        1D array of radial values.
+    radial_profile : ndarray or list of ndarray
+        For m=0: 1D array of radial values.
+        For m>0: list of two 1D arrays (cosine and sine quadratures).
     r_vals : ndarray
         1D array of radial coordinates.
-    save_path : str, optional
-        If provided, saves the plot to this path.
+    save_path : str
+        Saves the plot to this path.
     """
     from src.utils.polar_transform import polar_to_cartesian
     import matplotlib.pyplot as plt
@@ -190,10 +144,15 @@ def plot_angular_mode(eigenvector: np.ndarray, mode: int, radial_profile: np.nda
     L = int(np.sqrt(eigenvector.shape[0]))
     eigen_img = eigenvector.reshape(L, L)
     theta_vals = np.linspace(0, 2 * np.pi, settings.data_generation.cartesian_to_polar_n_theta, endpoint=False)
-    polar_recon = radial_profile[:, None] * np.exp(1j * mode * theta_vals)[None, :]
+    if mode == 0:
+        polar_recon = radial_profile[:, None] * np.ones_like(theta_vals)[None, :]
+    else:
+        polar_recon = radial_profile[0][:, None] * np.cos(mode * theta_vals)[None, :] - \
+                        radial_profile[1][:, None] * np.sin(mode * theta_vals)[None, :]
     # Convert to Cartesian
     recon_img = polar_to_cartesian(polar_recon, r_vals)
-
+    print(np.linalg.norm(recon_img))
+    print(np.linalg.norm(eigen_img))
     plt.figure(figsize=(18, 6))
     # Original eigenvector
     plt.subplot(1, 3, 1)
@@ -209,7 +168,12 @@ def plot_angular_mode(eigenvector: np.ndarray, mode: int, radial_profile: np.nda
     plt.colorbar()
     # Radial profile
     plt.subplot(1, 3, 3)
-    plt.plot(r_vals, np.real(radial_profile), 'b-', linewidth=2)
+    if isinstance(radial_profile, (list, tuple)) or (isinstance(radial_profile, np.ndarray) and radial_profile.ndim == 2):
+        plt.plot(r_vals, np.real(radial_profile[0]), 'b-', linewidth=2, label='cos')
+        plt.plot(r_vals, np.real(radial_profile[1]), 'r-', linewidth=2, label='sin')
+        plt.legend()
+    else:
+        plt.plot(r_vals, np.real(radial_profile), 'b-', linewidth=2, label='radial')
     plt.title("Radial Profile")
     plt.xlabel("Radius")
     plt.ylabel("Value")
@@ -329,9 +293,15 @@ def visualize_eigenvectors(eigenvectors: np.ndarray,
     
     # Infer L from eigenvector shape: L² = eigenvectors.shape[0]
     L = int(np.sqrt(eigenvectors.shape[0]))
-    
-    # Fixed 3x3 grid (9 vectors per plot)
-    vectors_per_plot = 9
+
+    is_complex = np.iscomplexobj(eigenvectors)
+    # Determine subplot arrangement
+    if is_complex:
+        vectors_per_plot = 4
+        rows, cols = 2, 4
+    else:
+        vectors_per_plot = 9
+        rows, cols = 3, 3
     
     # Create eigenvector_visualization subfolder
     eigenvec_dir = os.path.join(save_dir, "eigenvector_visualization")
@@ -343,37 +313,36 @@ def visualize_eigenvectors(eigenvectors: np.ndarray,
     for plot_idx in range(num_plots):
         start_idx = plot_idx * vectors_per_plot
         end_idx = min(start_idx + vectors_per_plot, num_show)
-        current_num_show = end_idx - start_idx
-        
-        # Determine subplot arrangement (3x3 grid for 9 vectors)
-        cols = 3
-        rows = 3
-        
-        fig, axes = plt.subplots(rows, cols, figsize=(12, 12))
+        fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 4*rows))
         axes = axes.flatten()
         
-        for i in range(current_num_show):
-            global_idx = start_idx + i
+        for i,idx in enumerate(range(start_idx, end_idx)):
             # Reshape eigenvector to image
-            eigenvec_img = eigenvectors[:, global_idx].reshape(L, L)
-            
-            ax = axes[i]
-            im = ax.imshow(eigenvec_img, cmap='RdBu_r', aspect='equal')
-            ax.set_title(f'λ_{global_idx+1} = {eigenvalues[global_idx]:.2e}', fontsize=10)
-            ax.axis('off')
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            eigenvec_img = eigenvectors[:, idx].reshape(L, L)
+
+            if is_complex:
+                # Real part (top row)
+                ax_real = axes[i]
+                im_real = ax_real.imshow(np.real(eigenvec_img), cmap='RdBu_r', aspect='equal')
+                ax_real.set_title(f'Real λ_{idx+1}={eigenvalues[idx]:.2e}', fontsize=10)
+                plt.colorbar(im_real, ax=ax_real, fraction=0.046, pad=0.04)
+                ax_real.axis('off')
+                # Imaginary part (bottom row)
+                ax_imag = axes[i + cols]
+                im_imag = ax_imag.imshow(np.imag(eigenvec_img), cmap='RdBu_r', aspect='equal')
+                ax_imag.set_title(f'Imag λ_{idx+1}={eigenvalues[idx]:.2e}', fontsize=10)
+                plt.colorbar(im_imag, ax=ax_imag, fraction=0.046, pad=0.04)
+                ax_imag.axis('off')
+            else:
+                ax = axes[i]
+                im = ax.imshow(eigenvec_img, cmap='RdBu_r', aspect='equal')
+                ax.set_title(f'λ_{idx+1} = {eigenvalues[idx]:.2e}', fontsize=10)
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                ax.axis('off')
         
         # Hide unused subplots
-        for i in range(current_num_show, len(axes)):
-            axes[i].set_visible(False)
-        
-        # Create plot-specific title
-        if num_plots > 1:
-            plot_title = f"{title} - Part {plot_idx + 1}/{num_plots} (λ_{start_idx+1}-λ_{end_idx})"
-        else:
-            plot_title = title
-        
-        plt.suptitle(plot_title, fontsize=16)
+        for j in range((end_idx-start_idx)*2 if is_complex else end_idx-start_idx, len(axes)):
+            axes[j].set_visible(False)
         plt.tight_layout()
         
         if num_plots > 1:
@@ -455,7 +424,7 @@ if __name__ == "__main__":
     print("=== Spectral Analysis Workflow - vMF Mixture ===")
     print(f"Downsample size: {downsample_size}")
     print(f"Device: {device_str}")
-    emdb_id = "emd_47365"
+    emdb_id = "emd_52988"
     emdb_path = f"/data/shachar/emdb_downloads/{emdb_id}.map.gz"
     save_dir = f"outputs/spectral_analysis/{emdb_id}"
     
@@ -467,7 +436,6 @@ if __name__ == "__main__":
     from src.utils.distribution_generation_functions import generate_weighted_random_s2_points
     from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution
     from src.core.volume_distribution_model import VolumeDistributionModel
-    # quadrature_points, s2_distribution = generate_weighted_random_s2_points(1)
     n_quadrature = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
     quadrature_points = fibonacci_sphere_points(n_quadrature)
     mu, kappa, weights = generate_random_vmf_parameters(
@@ -475,9 +443,10 @@ if __name__ == "__main__":
                 settings.data_generation.von_mises_fisher.kappa_start,
                 settings.data_generation.von_mises_fisher.kappa_mean)
     s2_distribution = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
+    # quadrature_points, s2_distribution = generate_weighted_random_s2_points(1)
     so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
-                                                                            num_in_plane_rotations=32)
-    vdm = VolumeDistributionModel(volume, rotations=so3_rotations, distribution=so3_weights)
+                                                                            num_in_plane_rotations=200)
+    vdm = VolumeDistributionModel(volume, rotations=so3_rotations, distribution=so3_weights, fourier_domain=False)
 
     # vdm = generate_vdm_from_volume(volume, 'vmf_mixture', downsample_size=downsample_size)
     # Compute moments
@@ -487,15 +456,13 @@ if __name__ == "__main__":
     
     second_moment = vdm.second_analytical_moment(
         batch_size=second_moment_batch_size, 
-        show_progress=True, 
-        dtype=torch.float64
+        show_progress=True
     )
     print(f"   Second moment computed: shape {second_moment.shape}")
     
     # Perform spectral analysis
     print("\n3. Performing spectral analysis...")
     eigenvalues, eigenvectors = compute_second_moment_eigendecomposition(second_moment)
-    
     # Create output directory
     os.makedirs(save_dir, exist_ok=True)
     
@@ -510,10 +477,11 @@ if __name__ == "__main__":
     visualize_eigenvectors(
         eigenvectors, eigenvalues,
         save_dir,
-        num_show=9,
+        num_show=180,
         title=f"Principal Eigenvectors"
     )
     n_keep = num_components_for_energy_threshold(eigenvalues, 1e-8)
+    print(f"Number of components to keep 1-1e-8 energy: {n_keep}")
     compressed_eigenspaces = extract_dominant_eigenvector_modes(eigenvectors[:, :n_keep])
     
     # Save first moment as image
@@ -524,25 +492,56 @@ if __name__ == "__main__":
     plt.axis('off')
     plt.savefig(os.path.join(save_dir, "first_moment.png"), dpi=150, bbox_inches='tight')
     plt.close()
-    
 
-    print(f"\n6. Analysis complete!")
-    print(f"   All outputs saved to: {save_dir}")
-    
-    # Print summary statistics
-    print(f"\n=== Summary Statistics ===")
     print(f"SO(3) quadrature: {len(vdm.rotations):,} rotations")
     print(f"Spectral properties:")
     print(f"  1 - 1e-4 energy in top: {num_components_for_energy_threshold(eigenvalues, 1e-4)} components")
     print(f"  1 - 1e-8 of energy in top: {num_components_for_energy_threshold(eigenvalues, 1e-8)} components")
     idx = np.random.randint(len(compressed_eigenspaces))
+    idx = 0
     eig = compressed_eigenspaces[idx]
     eigenvector = eigenvectors[:, idx]
     L = int(np.sqrt(eigenvectors.shape[0]))
     _, r_vals, _ = cartesian_to_polar(eigenvector.reshape(L, L))
-    save_path = os.path.join(save_dir, f"angular_mode_example_{idx}_m.png")
-    plot_angular_mode(eigenvector, eig['m_detected'], eig['radial_profile'], r_vals, save_path=save_path)
-    for i, eig in enumerate(compressed_eigenspaces[:9]):
+    save_path = os.path.join(save_dir, f"angular_mode_example_{idx+1}_m.png")
+    if eig['m_detected'] == 0:
+        plot_angular_mode(eigenvector, eig['m_detected'], eig['radial_profile'], r_vals, save_path=save_path)
+    else:
+        plot_angular_mode(eigenvector, eig['m_detected'], [eig['cos_component'], eig['sin_component']], r_vals, save_path=save_path)
+    print(f"Saved angular mode plot for eigenspace {idx} to {save_path}")
+
+    # plot_angular_mode(eigenvector, eig['m_detected'], eig['radial_profile'], r_vals, save_path=save_path)
+    cos1 = compressed_eigenspaces[1]["cos_component"]
+    sin1 = compressed_eigenspaces[1]["sin_component"]
+    cos2 = compressed_eigenspaces[2]["cos_component"]
+    sin2 = compressed_eigenspaces[2]["sin_component"]
+    print(f"Comparing cos and sin components of eigenspaces 1 and 2...")
+    print(f"Difference cos: {np.linalg.norm(cos1 - cos2)}")
+    print(f"Difference sin: {np.linalg.norm(sin1 - sin2)}")
+    print(f"cos1 norm: {np.linalg.norm(cos1)}")
+    print(f"cos2 norm: {np.linalg.norm(cos2)}")
+    print(f"sin1 norm: {np.linalg.norm(sin1)}")
+    print(f"sin2 norm: {np.linalg.norm(sin2)}")
+    # Plot cos and sin components side by side for comparison
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+    axes[0, 0].plot(cos1, label='cos1', color='b')
+    axes[0, 0].set_title('cos1')
+    axes[0, 1].plot(cos2, label='cos2', color='g')
+    axes[0, 1].set_title('cos2')
+    axes[1, 0].plot(sin1, label='sin1', color='r')
+    axes[1, 0].set_title('sin1')
+    axes[1, 1].plot(sin2, label='sin2', color='m')
+    axes[1, 1].set_title('sin2')
+    for ax in axes.flat:
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'cos_sin_comparison.png'), dpi=150)
+    print(f"Saved cos/sin comparison plot to {os.path.join(save_dir, 'cos_sin_comparison.png')}")
+    plt.close(fig)
+
+    for i, eig in enumerate(compressed_eigenspaces[:200]):
         print(f"--- Compressed Eigenspace {i+1} ---")
         for k, v in eig.items():
             if isinstance(v, np.ndarray):
