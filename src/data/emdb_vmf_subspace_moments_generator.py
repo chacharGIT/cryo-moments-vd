@@ -105,7 +105,8 @@ def main():
                 eigvals, _ = compute_second_moment_eigendecomposition(second_moment)
                 n_keep = num_components_for_energy_threshold(eigvals, settings.data_generation.second_moment_energy_truncation_threshold)
                 n_keep_list.append(n_keep)
-
+                
+                """
                 emdb_id = "emd_52988"
                 emdb_path = f"/data/shachar/emdb_downloads/{emdb_id}.map.gz"
                 volume = load_aspire_volume(emdb_path, downsample_size=settings.data_generation.downsample_size)
@@ -121,6 +122,7 @@ def main():
                 n_keep_new = num_components_for_energy_threshold(eigvals_new, settings.data_generation.second_moment_energy_truncation_threshold)
                 print(f"Probe n_keep: {n_keep}, n_keep_new: {n_keep_new}")
                 print(f"Second moment difference norm: {np.linalg.norm(second_moment - new_second_moment)}")
+                """
 
 
             n_eigen_target = int(max(n_keep_list) * 1.1) # Add 10% buffer

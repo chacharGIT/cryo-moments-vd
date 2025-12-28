@@ -151,8 +151,6 @@ def plot_angular_mode(eigenvector: np.ndarray, mode: int, radial_profile: np.nda
                         radial_profile[1][:, None] * np.sin(mode * theta_vals)[None, :]
     # Convert to Cartesian
     recon_img = polar_to_cartesian(polar_recon, r_vals)
-    print(np.linalg.norm(recon_img))
-    print(np.linalg.norm(eigen_img))
     plt.figure(figsize=(18, 6))
     # Original eigenvector
     plt.subplot(1, 3, 1)
@@ -182,6 +180,55 @@ def plot_angular_mode(eigenvector: np.ndarray, mode: int, radial_profile: np.nda
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Eigenvector comparison saved to {save_path}")
     plt.close()
+
+def plot_m_detected_average_histogram(zarr_path, save_path=None):
+    import zarr
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    root = zarr.open(zarr_path, mode='r')
+    all_m_detected = []
+    # Collect all m_detected arrays per experiment
+    for volume_id in root.group_keys():
+        group = root[volume_id]
+        if "eigen_m_detected" in group:
+            m_detected_arr = group["eigen_m_detected"][:]  # shape: [num_experiments_in_group, ...]
+            # Loop over experiments in this group
+            for m_detected in m_detected_arr:
+                all_m_detected.append(m_detected.flatten())
+    if not all_m_detected:
+        print("No m_detected data found.")
+        return
+
+    # Find global min/max m
+    m_min = min(m.min() for m in all_m_detected)
+    m_max = max(m.max() for m in all_m_detected)
+    bins = np.arange(m_min, m_max + 2) - 0.5  # one bin per integer
+
+    # Compute histogram for each experiment
+    histograms = []
+    for m in all_m_detected:
+        hist, _ = np.histogram(m, bins=bins)
+        histograms.append(hist)
+    histograms = np.stack(histograms, axis=0)  # shape: [num_experiments, num_bins]
+
+    avg_counts = histograms.mean(axis=0)
+
+    avg_total = avg_counts.sum()
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(np.arange(m_min, m_max + 1), avg_counts, width=1, edgecolor='black')
+    plt.xlabel('Detected Angular Mode (m)')
+    plt.ylabel('Average Count per Experiment')
+    plt.title('Average Histogram of Detected Angular Modes Across All Experiments')
+    plt.legend([f"Avg. vectors/experiment: {avg_total:.1f}"])
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+        print(f"Saved average histogram to {save_path}")
+    plt.close()
+
+    return avg_counts
 
 def plot_eigenvalues(eigenvalues: np.ndarray, 
                     log_scale: bool = True,
@@ -408,8 +455,7 @@ def compare_images_with_optimal_normalization(image1: np.ndarray, image2: np.nda
     
     return min_distance
 
-
-if __name__ == "__main__":
+def main():
     import os
     from config.config import settings
     from src.data.emdb_downloader import load_aspire_volume
@@ -421,15 +467,11 @@ if __name__ == "__main__":
     second_moment_batch_size = settings.data_generation.second_moment_batch_size
     device_str = f"cuda:{settings.device.cuda_device}" if settings.device.use_cuda else "cpu"
     
-    print("=== Spectral Analysis Workflow - vMF Mixture ===")
-    print(f"Downsample size: {downsample_size}")
-    print(f"Device: {device_str}")
+    print("=== Spectral Analysis Workflow ===")
     emdb_id = "emd_52988"
     emdb_path = f"/data/shachar/emdb_downloads/{emdb_id}.map.gz"
     save_dir = f"outputs/spectral_analysis/{emdb_id}"
-    
-    # Generate VDM using the generator
-    print("\n1. Loading volume and generating VDM...")
+
     volume = load_aspire_volume(emdb_path, downsample_size=settings.data_generation.downsample_size)
     volume = volume.downsample(downsample_size)
 
@@ -445,29 +487,26 @@ if __name__ == "__main__":
     s2_distribution = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
     # quadrature_points, s2_distribution = generate_weighted_random_s2_points(1)
     so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
-                                                                            num_in_plane_rotations=200)
+                                                                            num_in_plane_rotations=320)
     vdm = VolumeDistributionModel(volume, rotations=so3_rotations, distribution=so3_weights, fourier_domain=False)
 
     # vdm = generate_vdm_from_volume(volume, 'vmf_mixture', downsample_size=downsample_size)
     # Compute moments
-    print("\n2. Computing analytical moments...")
+    print("\n Computing analytical moments...")
     first_moment = vdm.first_analytical_moment()
-    print(f"   First moment computed: shape {first_moment.shape}")
-    
     second_moment = vdm.second_analytical_moment(
         batch_size=second_moment_batch_size, 
         show_progress=True
     )
-    print(f"   Second moment computed: shape {second_moment.shape}")
     
     # Perform spectral analysis
-    print("\n3. Performing spectral analysis...")
+    print("\n Performing decomposition...")
     eigenvalues, eigenvectors = compute_second_moment_eigendecomposition(second_moment)
     # Create output directory
     os.makedirs(save_dir, exist_ok=True)
     
     # Plot eigenvalues
-    print("\n4. Creating visualizations...")
+    print("\n Plotting eigen images...")
     plot_eigenvalues(
         eigenvalues, 
         save_path=os.path.join(save_dir, "eigenvalue_spectrum.png")
@@ -477,7 +516,7 @@ if __name__ == "__main__":
     visualize_eigenvectors(
         eigenvectors, eigenvalues,
         save_dir,
-        num_show=180,
+        num_show=9,
         title=f"Principal Eigenvectors"
     )
     n_keep = num_components_for_energy_threshold(eigenvalues, 1e-8)
@@ -492,6 +531,19 @@ if __name__ == "__main__":
     plt.axis('off')
     plt.savefig(os.path.join(save_dir, "first_moment.png"), dpi=150, bbox_inches='tight')
     plt.close()
+
+    # Plot histogram of m_detected
+    m_vals = [eig['m_detected'] for eig in compressed_eigenspaces]
+    bins = np.arange(min(m_vals), max(m_vals)+2) - 0.5
+    plt.figure(figsize=(8, 5))
+    plt.hist(m_vals, bins=bins, edgecolor='black')
+    plt.xlabel('Detected Angular Mode (m)')
+    plt.ylabel('Count')
+    plt.title('Histogram of Detected Angular Modes')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "m_detected_histogram.png"), dpi=150)
+    plt.close()
+    print("Saved histogram of m_detected to", os.path.join(save_dir, "m_detected_histogram.png"))
 
     print(f"SO(3) quadrature: {len(vdm.rotations):,} rotations")
     print(f"Spectral properties:")
@@ -510,41 +562,21 @@ if __name__ == "__main__":
         plot_angular_mode(eigenvector, eig['m_detected'], [eig['cos_component'], eig['sin_component']], r_vals, save_path=save_path)
     print(f"Saved angular mode plot for eigenspace {idx} to {save_path}")
 
-    # plot_angular_mode(eigenvector, eig['m_detected'], eig['radial_profile'], r_vals, save_path=save_path)
-    cos1 = compressed_eigenspaces[1]["cos_component"]
-    sin1 = compressed_eigenspaces[1]["sin_component"]
-    cos2 = compressed_eigenspaces[2]["cos_component"]
-    sin2 = compressed_eigenspaces[2]["sin_component"]
-    print(f"Comparing cos and sin components of eigenspaces 1 and 2...")
-    print(f"Difference cos: {np.linalg.norm(cos1 - cos2)}")
-    print(f"Difference sin: {np.linalg.norm(sin1 - sin2)}")
-    print(f"cos1 norm: {np.linalg.norm(cos1)}")
-    print(f"cos2 norm: {np.linalg.norm(cos2)}")
-    print(f"sin1 norm: {np.linalg.norm(sin1)}")
-    print(f"sin2 norm: {np.linalg.norm(sin2)}")
-    # Plot cos and sin components side by side for comparison
-    import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
-    axes[0, 0].plot(cos1, label='cos1', color='b')
-    axes[0, 0].set_title('cos1')
-    axes[0, 1].plot(cos2, label='cos2', color='g')
-    axes[0, 1].set_title('cos2')
-    axes[1, 0].plot(sin1, label='sin1', color='r')
-    axes[1, 0].set_title('sin1')
-    axes[1, 1].plot(sin2, label='sin2', color='m')
-    axes[1, 1].set_title('sin2')
-    for ax in axes.flat:
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'cos_sin_comparison.png'), dpi=150)
-    print(f"Saved cos/sin comparison plot to {os.path.join(save_dir, 'cos_sin_comparison.png')}")
-    plt.close(fig)
-
-    for i, eig in enumerate(compressed_eigenspaces[:200]):
+    for i, eig in enumerate(compressed_eigenspaces[:180]):
         print(f"--- Compressed Eigenspace {i+1} ---")
         for k, v in eig.items():
             if isinstance(v, np.ndarray):
                 print(f"{k}: shape {v.shape}, dtype {v.dtype}")
             else:
                 print(f"{k}: {v}")
+
+if __name__ == "__main__":
+    avg_counts = plot_m_detected_average_histogram(zarr_path="/data/shachar/zarr_files/emdb_vmf_subspace_moments_separated.zarr",
+                                       save_path="outputs/spectral_analysis/m_detected_average_histogram.png")
+    rounded_counts = np.round(avg_counts * 1.1).astype(int)
+    # Remove trailing zeros
+    last_nonzero = np.max(np.nonzero(rounded_counts)) + 1 if np.any(rounded_counts) else 0
+    rounded_counts_trimmed = rounded_counts[:last_nonzero]
+    print(f"Average m_detected counts (length {len(rounded_counts_trimmed)}):", rounded_counts_trimmed)
+    # Save trimmed array
+    print(f"Sum of rounded counts: {rounded_counts_trimmed.sum()}")
