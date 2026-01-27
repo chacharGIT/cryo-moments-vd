@@ -4,9 +4,9 @@ from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_s
 def dpf_score_matching_loss(
     pred_score, true_score,
     scale_invariant=False,
-    variance_matching=False, lambda_var=0.035,
-    correlation_matching=False, lambda_corr=0.012,
-    third_cumulant_matching=False, lambda_cum3=0.01
+    variance_matching=True, lambda_var=0.4,
+    correlation_matching=False, lambda_corr=0.2,
+    third_cumulant_matching=False, lambda_cum3=0.03
 ):
     """
     Computes the DPF score matching loss between predicted and true scores, with optional regularization terms.
@@ -16,11 +16,11 @@ def dpf_score_matching_loss(
         true_score (torch.Tensor): True score (precomputed), shape [batch, ...].
         scale_invariant (bool, optional): If True, normalizes the MSE loss by the variance of true_score. Default: False.
         variance_matching (bool, optional): If True, adds a penalty for the difference in variance between pred_score and true_score. Default: False.
-        lambda_var (float, optional): Weight for the variance matching penalty. Default: 0.03.
+        lambda_var (float, optional): Weight for the variance matching penalty.
         correlation_matching (bool, optional): If True, adds a penalty for the difference in Pearson correlation between pred_score and true_score. Default: False.
-        lambda_corr (float, optional): Weight for the correlation matching penalty. Default: 0.03.
+        lambda_corr (float, optional): Weight for the correlation matching penalty.
         third_cumulant_matching (bool, optional): If True, adds a penalty for the difference in third cumulant (skewness) between pred_score and true_score. Default: False.
-        lambda_cum3 (float, optional): Weight for the third cumulant matching penalty. Default: 0.01.
+        lambda_cum3 (float, optional): Weight for the third cumulant matching penalty.
     
     Returns:
         torch.Tensor: Scalar loss value.

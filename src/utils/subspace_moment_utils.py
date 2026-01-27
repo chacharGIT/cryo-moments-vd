@@ -15,7 +15,7 @@ def compute_second_moment_eigendecomposition(second_moment: Union[np.ndarray, to
     Compute the eigendecomposition of the second moment tensor.
 
     The second moment tensor has shape (L, L, L, L) and can be viewed as a linear operator
-    acting on the image space of size L×L. This function reshapes it to (L², L²) and 
+    acting on the image space of size (L, L). This function reshapes it to (L², L²) and 
     computes its eigendecomposition.
 
     Parameters

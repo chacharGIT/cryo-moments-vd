@@ -14,16 +14,15 @@ class S2ScoreNetwork(nn.Module):
         # Calculate PerceiverIO input and output dimensions based on encoding settings
         time_enc_len = settings.dpf.time_encoding_len  # Fourier encoding length
         sph_enc_len = settings.dpf.pos_encoding_max_harmonic_degree  # Spherical harmonics max degree
-        d = 1  # Number of function data channels (change if needed)
 
         # Fourier encoding: 2 values (sin, cos) per frequency
         fourier_dim = time_enc_len * 2
         # Spherical harmonics: (L+1)^2-1 real harmonics - Exclude l=0 (constant) term
         sph_dim = (sph_enc_len + 1) ** 2 - 1
 
-        context_dim = fourier_dim + sph_dim + d  # Full context encoding
+        context_dim = fourier_dim + sph_dim + 1  # Full context encoding
         query_dim = context_dim
-        output_dim = d  # Output dimension (score per point)
+        output_dim = 1  # Output dimension (score per point)
 
         # Prepare PerceiverIO config, override dims to match input construction
         if perceiver_config is None:

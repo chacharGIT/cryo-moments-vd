@@ -19,7 +19,15 @@ from src.utils.subspace_moment_utils import compute_second_moment_eigendecomposi
 from config.config import settings
 
 def main():
-    save_path = "/data/shachar/zarr_files/emdb_vmf_subspace_moments_separated.zarr"
+    # Generate quadrature points once
+    n_quadrature = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
+    quadrature_points = fibonacci_sphere_points(n_quadrature)
+    separate_fourier_modes = settings.data_generation.separate_fourier_modes
+
+    if separate_fourier_modes:
+        save_path = settings.data_generation.zarr.separated_modes_data_save_path
+    else:
+        save_path = settings.data_generation.zarr.save_path
     save_interval = 100  # Save every save_interval samples
     root = zarr.open(save_path, mode='a')  # Use append mode
     # Use CUDA device from settings if enabled
@@ -27,11 +35,7 @@ def main():
         device = f"cuda:{settings.device.cuda_device}"
     else:
         device = "cpu"
-
-    # Generate quadrature points once
-    n_quadrature = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
-    quadrature_points = fibonacci_sphere_points(n_quadrature)
-    separate_fourier_modes = settings.data_generation.separate_fourier_modes
+    
     # Preallocate lists for all samples (to be periodically flushed)
     all_means = []
     all_kappas = []
@@ -51,15 +55,12 @@ def main():
     emdb_folder = settings.data_generation.emdb.download_folder
     emdb_files = [os.path.join(emdb_folder, f) for f in os.listdir(emdb_folder) if f.endswith('.map.gz')]
     np.random.shuffle(emdb_files)
-    precomputed_folder = "/data/shachar/zarr_files/emdb_in_plane_invariant_moment_subspace_components"
+    precomputed_folder = settings.data_generation.zarr.precomputed_moments_path
 
     num_mixtures_per_volume = settings.data_generation.von_mises_fisher.num_generated_examples_per_volume
     print("number of mixtures per volume:", num_mixtures_per_volume)
     for emdb_file in tqdm(emdb_files, desc="EMDB Volumes"):
         emdb_id = os.path.basename(emdb_file).split('.')[0]
-
-        emdb_id = "emd_52988"
-
         print(f"Processing EMDB {emdb_id}")
         zarr_path = os.path.join(precomputed_folder, f"{emdb_id}.zarr")
         try:
@@ -105,26 +106,6 @@ def main():
                 eigvals, _ = compute_second_moment_eigendecomposition(second_moment)
                 n_keep = num_components_for_energy_threshold(eigvals, settings.data_generation.second_moment_energy_truncation_threshold)
                 n_keep_list.append(n_keep)
-                
-                """
-                emdb_id = "emd_52988"
-                emdb_path = f"/data/shachar/emdb_downloads/{emdb_id}.map.gz"
-                volume = load_aspire_volume(emdb_path, downsample_size=settings.data_generation.downsample_size)
-                volume = volume.downsample(settings.data_generation.downsample_size)
-                so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, mixture_eval, 
-                                                                                        num_in_plane_rotations=200)
-                vdm = VolumeDistributionModel(volume, rotations=so3_rotations, distribution=so3_weights, fourier_domain=False)
-                new_second_moment = vdm.second_analytical_moment(
-                                        batch_size=50, 
-                                        show_progress=True
-                                    )
-                eigvals_new, _ = compute_second_moment_eigendecomposition(new_second_moment)
-                n_keep_new = num_components_for_energy_threshold(eigvals_new, settings.data_generation.second_moment_energy_truncation_threshold)
-                print(f"Probe n_keep: {n_keep}, n_keep_new: {n_keep_new}")
-                print(f"Second moment difference norm: {np.linalg.norm(second_moment - new_second_moment)}")
-                """
-
-
             n_eigen_target = int(max(n_keep_list) * 1.1) # Add 10% buffer
             print(f"Determined n_eigen_target for {emdb_id}: {n_eigen_target}")
             volume_group = root.require_group(emdb_id)
@@ -133,7 +114,7 @@ def main():
             n_eigen_target = volume_group["eigen_values"].shape[-1]
             print(f"Loaded n_eigen_target for {emdb_id}: {n_eigen_target}")
 
-        for i in tqdm(range(num_mixtures_per_volume), desc=f"Mixtures for {emdb_id}", leave=False):
+        for _ in tqdm(range(num_mixtures_per_volume), desc=f"Mixtures for {emdb_id}", leave=False):
             # Sample vMF mixture
             mu, kappa, weights = generate_random_vmf_parameters(
                 settings.data_generation.von_mises_fisher.num_distributions,

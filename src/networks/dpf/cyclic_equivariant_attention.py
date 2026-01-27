@@ -2,58 +2,85 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class CyclicEquivariantAttentionLayer(nn.Module):
-    def __init__(self, Pms_in, Pms_out, D, d_k, d_v, num_heads, ff_hidden=128, ff_layers=2, nonlinearity=F.relu):
-        """
+from config.config import settings
+from src.networks.dpf.set_transformer import ComplexLinear
+
+class CyclicEquivariantAttentionBlock(nn.Module):
+    def __init__(self, n_queries_per_m, d_k, d_v, D, R, num_heads,
+                 ff_hidden_dim, nonlinearity, project_back=True):
+        """Cyclic equivariant attention with learned per-mode complex projections.
+
         Args:
-            Pms_in: dict mapping m to P_m_in (D x N_m) torch.complex64 tensors (input projections)
-            Pms_out: dict mapping m to P_m_out (R x N_m) torch.complex64 tensors (output projections)
-            D: projection dimension
+            n_queries_per_m: 1D array/list, N_m for m=0..M (len = num_modes)
             d_k: attention key/query dimension
             d_v: attention value dimension
+            D: latent dimension after per-mode projection
+            R: feature dimension along the radial axis
             num_heads: number of attention heads
-            ff_hidden: hidden dim for feedforward
-            ff_layers: number of feedforward layers
+            ff_hidden_dim: hidden dim for feedforward
             nonlinearity: nonlinearity for head mixing and feedforward
         """
         super().__init__()
-        self.Pms_in = Pms_in
-        self.Pms_out = Pms_out
-        self.R = Pms_in[self.ms[0]].shape[1]
-        self.ms = sorted(Pms_in.keys())
+        self.R = R
         self.D = D
-        self.num_modes = len(self.ms)
+        self.project_back = project_back
         self.d_k = d_k
         self.d_v = d_v
         self.num_heads = num_heads
         self.nonlinearity = nonlinearity
 
+        # Mode indices as strings: "0", "1", ...
+        self.ms = [str(m) for m in range(len(n_queries_per_m))]
+        self.num_modes = len(self.ms)
+
+        # Learned per-mode complex projections using ComplexLinear
+        # Qms_in[m]: ComplexLinear(N_m -> D), Qms_out[m]: ComplexLinear(D -> N_m)
+        self.Qms_in = nn.ModuleDict()
+        self.Qms_out = nn.ModuleDict()
+        for m_idx, N_m in enumerate(n_queries_per_m):
+            key = str(m_idx)
+            N_m_int = int(N_m)
+            self.Qms_in[key] = ComplexLinear(N_m_int, D)
+            self.Qms_out[key] = ComplexLinear(D, N_m_int)
+
+        # For m = 0, start with purely real projections (imag weights = 0)
+        with torch.no_grad():
+            self.Qms_in["0"].imag_weight.zero_()
+            self.Qms_out["0"].imag_weight.zero_()
+
         # Attention weights for each head
-        self.W_Q = nn.Parameter(torch.randn(num_heads, 1, 1, self.R, d_k)) # [H, 1, 1, R, d_k]
-        self.W_K = nn.Parameter(torch.randn(num_heads, 1, 1, self.R, d_k))
-        self.W_V = nn.Parameter(torch.randn(num_heads, 1, 1, self.R, d_v))
+        self.W_Q = nn.Parameter(torch.randn(num_heads, self.R, d_k))
+        self.W_K = nn.Parameter(torch.randn(num_heads, self.R, d_k))
+        self.W_V = nn.Parameter(torch.randn(num_heads, self.R, d_v))
 
         # Head mixing
         self.W_H = nn.Parameter(torch.randn(num_heads, num_heads))
 
         # Feedforward layers (row-wise)
-        ff_layers_list = []
         in_dim = d_v * num_heads
-        for _ in range(ff_layers - 1):
-            ff_layers_list.append(nn.Linear(in_dim, ff_hidden))
-            ff_layers_list.append(nn.ReLU())
-            in_dim = ff_hidden
-        ff_layers_list.append(nn.Linear(in_dim, self.R))
-        self.feedforward = nn.Sequential(*ff_layers_list)
+        self.post_mha_linear = nn.Sequential(
+            nn.Linear(in_dim, R),
+            self.nonlinearity
+        )
+        
+        self.feedforward = nn.Sequential(
+            nn.Linear(R, ff_hidden_dim),
+            self.nonlinearity,
+            nn.Dropout(0.05),
+            nn.Linear(ff_hidden_dim, R)
+        )
+
+        self.ln_attn_in = nn.LayerNorm(R)
+        self.ln_ff_in = nn.LayerNorm(R)
 
     def forward(self, V):
         """
         Args:
-            V: dict mapping m to V_m (N_m x R) torch.complex64 tensors
+            V: dict mapping m (str) -> V_m (B x N_m x R) torch.complex64 tensors
+               (B: batch size, N_m: number of queries for mode m, R: feature dim)
         Returns:
-            out: dict mapping m to output (N_m x R) torch.complex64 tensors
+            out: dict mapping m (str) -> (B x N_m x R) torch.complex64 tensors
         """
-        device = self.W_Q.device
         ms = self.ms
         D = self.D
         H = self.num_heads
@@ -62,52 +89,60 @@ class CyclicEquivariantAttentionLayer(nn.Module):
         num_modes = self.num_modes
         T = 2 * num_modes - 1
         R = self.R
+        B = V[ms[0]].shape[0]
 
-        # Project each mode to D x R (only m >= 0, hermitian symmetry)
+        # Project each mode to D x R via learned complex linears (only m >= 0, hermitian symmetry)
         A_hat = []
         for m in ms:
-            Pm_in = self.Pms_in[m].to(device)  # [D, N_m]
-            V_m = V[m].to(device)         # [N_m, R]
-            A_hat_m = torch.matmul(Pm_in, V_m)  # [D, R]
-            A_hat.append(A_hat_m.unsqueeze(0))
-        A_hat = torch.cat(A_hat, dim=0)  # [num_modes, D, R]
+            V_m = V[m]
+            if m == "0":
+                V_m = V_m.real.to(torch.cfloat)
+            # V_m: [B, N_m, R] -> [B, R, N_m] so ComplexLinear acts on last dim N_m
+            V_m_perm = V_m.permute(0, 2, 1)       # [B, R, N_m]
+            A_hat_m = self.Qms_in[m](V_m_perm)    # [B, R, D]
+            A_hat_m = A_hat_m.permute(0, 2, 1)    # [B, D, R]
+            A_hat.append(A_hat_m.unsqueeze(1))
+        A_hat = torch.cat(A_hat, dim=1)           # [B, num_modes, D, R]
 
-        # Inverse real FFT along mode index to get A_t: [num_modes, D, R] -> [T, D, R]
-        # T = 2*num_modes-1
-        A_t = torch.fft.irfft(A_hat, n=T, dim=0)  # [T, D, R], real
+        # Inverse real FFT along mode index to get A_t: [B, T, D, R]
+        A_t = torch.fft.irfft(A_hat, n=T, dim=1) # [B, T, D, R], real
 
-        # Multi-head attention at each t
-        A_t_heads = []
-        for h in range(H):
-            # Linear projections: [T, D, R] x [1, 1, R, d_k/d_v] -> [T, D, d_k/d_v]
-            Q_h = torch.matmul(A_t, self.W_Q[h])  # [T, D, d_k]
-            K_h = torch.matmul(A_t, self.W_K[h])  # [T, D, d_k]
-            V_h = torch.matmul(A_t, self.W_V[h]) # [T, D, d_v]
+        A_t = self.ln_attn_in(A_t)
+        # Multi-head attention at each t. Projections for all heads at once:
+        # A_t: [B,T,D,R], W_Q: [H,R,d_k] -> Q: [B,T,H,D,d_k]
+        Q = torch.einsum('btdr,hrk->bthdk', A_t, self.W_Q)
+        K = torch.einsum('btdr,hrk->bthdk', A_t, self.W_K)
+        Vv = torch.einsum('btdr,hrv->bthdv', A_t, self.W_V)
+        Q = Q.reshape(B * T, H, D, d_k)   # [BT, H, D, d_k]
+        K = K.reshape(B * T, H, D, d_k)   # [BT, H, D, d_k]
+        Vv = Vv.reshape(B * T, H, D, d_v)  # [BT, H, D, d_v]
+        attn_out = F.scaled_dot_product_attention(
+        Q, K, Vv, attn_mask=None, dropout_p=0.05, is_causal=False
+        )
+        A_t_heads = attn_out.reshape(B, T, H, D, d_v) # [B,T,H,D,d_v]
+        A_t_heads = A_t_heads.permute(0, 1, 3, 4, 2)  # [B,T,D,d_v,H]
 
-            # Attention scores: [T, D, d_k] x [T, d_k, D] -> [T, D, D]
-            attn_scores = torch.matmul(Q_h, K_h.transpose(-2, -1)) / (d_k ** 0.5)
-            attn_weights = F.softmax(attn_scores, dim=-1)  # softmax over D
+        # Head mixing: [B, T, D, d_v, H] x [H, H] -> [B, T, D, d_v, H]
+        A_t_heads_mixed = torch.einsum('btdvh,hp->btdvp', A_t_heads, self.W_H)
+        A_t_heads_mixed = self.nonlinearity(A_t_heads_mixed)
 
-            # Output: [T, D, D] x [T, D, d_v] -> [T, D, d_v]
-            A_t_h = torch.matmul(attn_weights, V_h)
-            A_t_heads.append(A_t_h.unsqueeze(-1))  # [T, D, d_v, 1]
-        A_t_heads = torch.cat(A_t_heads, dim=-1)  # [T, D, d_v, H]
+        # Flatten head dim, apply feedforward row-wise: [B, T, D, d_v*H] -> [B, T, D, R]
+        A_t_mha = A_t_heads_mixed.reshape(B, T, D, d_v * H)
+        A_t = A_t + self.post_mha_linear(A_t_mha)  # Residual connection
+        A_t = self.ln_ff_in(A_t)
+        A_t = A_t + self.feedforward(A_t) # [B, T, D, R]
 
-        # Head mixing: [T, D, d_v, H] x [H, H] -> [T, D, d_v, H]
-        A_t_heads_mixed = torch.einsum('tdvh,hp->tdvp', A_t_heads, self.W_H)
-        A_t_heads_mixed = self.nonlinearity(A_t_heads_mixed)  # [T, D, d_v, H]
-
-        # Flatten head dimension and apply row-wise feedforward: [T, D, d_v*H]
-        A_t_ff = A_t_heads_mixed.reshape(T, D, d_v * H)
-        A_t_ff = self.feedforward(A_t_ff)  # [T, D, R]
-
-        # Real FFT along t to recover mode structure: [T, D, R] -> [num_modes, D, R]
-        A_hat_out = torch.fft.rfft(A_t_ff, dim=0)  # [num_modes, D, R]
-
-        # For each mode, project back to N_m x R using Pms_out
-        out = {}
-        for i, m in enumerate(ms):
-            # [D, R] x [R, N_m] -> [N_m, R]
-            out_m = torch.matmul(self.Pms_out[str(m)].conj().transpose(0, 1), A_hat_out[i])  # [N_m, R]
-            out[m] = out_m
-        return out
+        if self.project_back:
+            # Real FFT along t to recover modes: [B, T, D, R] -> [B, num_modes, D, R]
+            A_hat_out = torch.fft.rfft(A_t, dim=1)   # [B, num_modes, D, R]
+            # For each mode, project back to N_m x R using Qms_out
+            out = {}
+            for i, m in enumerate(ms):
+                A_hat_out_m = A_hat_out[:, i]                # [B, D, R]
+                A_hat_out_perm = A_hat_out_m.permute(0, 2, 1)  # [B, R, D]
+                out_m = self.Qms_out[m](A_hat_out_perm)        # [B, R, N_m]
+                out[m] = out_m.permute(0, 2, 1)                # [B, N_m, R]
+            return out
+        else:
+            return A_t
+        

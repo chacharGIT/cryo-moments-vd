@@ -152,6 +152,7 @@ class PerceiverIO(nn.Module):
                  seq_dropout_prob,
                  logits_dim=None,
                  ff_mult=4,
+                 cond_dim=None,
                  weight_tie_layers=False,
                  ):
         super().__init__()
@@ -176,24 +177,31 @@ class PerceiverIO(nn.Module):
         self.decoder_cross_attn = PreNorm(queries_dim, Attention(queries_dim, latent_dim, heads=cross_heads, dim_head=cross_dim_head), context_dim=latent_dim)
         self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim, mult=ff_mult))
         self.to_logits = nn.Linear(queries_dim, logits_dim) if exists(logits_dim) else nn.Identity()
-        # Learnable scaling for function value channels (assumed last d channels)
+        # Learnable scaling for function value channels (assumed last channel)
         self.func_scale = nn.Parameter(torch.ones(1) * 1e3)
+        
+        if exists(cond_dim):
+            self.cond_to_latent = nn.Sequential(
+                nn.Linear(cond_dim, cond_dim * 2),
+                GEGLU(),
+                nn.Linear(cond_dim, latent_dim * 2),
+                GEGLU(),
+                nn.Linear(latent_dim, latent_dim)
+            )
+
     def forward(self, data, mask=None, queries=None, cond_feat=None):
         b = data.shape[0]
-        # Apply learnable scaling to function value channels (last d channels)
-        # Get d from input shape
-        d = 1  # Default to 1, override if known
-        if hasattr(self, 'logits_dim'):
-            d = self.logits_dim
+        # Apply learnable scaling to function value channels (last channel)
+        if cond_feat is not None:
+            func_data = data[..., -1:] * self.func_scale + cond_feat.unsqueeze(-1)
         else:
-            pass
-        if d > 0:
-            func_data = data[..., -d:] * self.func_scale
-            data = torch.cat([data[..., :-d], func_data], dim=-1)
+            func_data = data[..., -1:] * self.func_scale
+        data = torch.cat([data[..., :-1], func_data], dim=-1)
+
         x = repeat(self.latents, 'n d -> b n d', b=b)
         # Additive conditioning: add cond_feat to latents if provided
         if cond_feat is not None:
-            cond_feat_exp = cond_feat.unsqueeze(1).expand(-1, x.shape[1], -1)
+            cond_feat_exp = self.cond_to_latent(cond_feat).unsqueeze(1).expand(-1, x.shape[1], -1)
             x = x + cond_feat_exp
         cross_attn, cross_ff = self.cross_attend_blocks
         if self.training and self.seq_dropout_prob > 0.:

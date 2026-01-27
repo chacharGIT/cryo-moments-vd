@@ -1,7 +1,7 @@
 import numpy as np
-from scipy import linalg
 from scipy.ndimage import map_coordinates
 from scipy.interpolate import CubicSpline
+
 from config.config import settings
 
 def cartesian_to_polar(cartesian_image, n_theta=settings.data_generation.cartesian_to_polar_n_theta,
