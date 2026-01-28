@@ -152,11 +152,16 @@ class ChunkShuffleIterableDataset(IterableDataset):
                 batch_indices = []
         # Yield any remaining samples as a final (smaller) batch
         if batch_indices:
-            if self.device is not None:
-                batch = to_device(self.dataset[batch_indices], self.device)
-            else:
-                batch = self.dataset[batch_indices]
-            yield batch
+            try:
+                if self.device is not None:
+                    batch = to_device(self.dataset[batch_indices], self.device)
+                else:
+                    batch = self.dataset[batch_indices]
+            except Exception as e:
+                print(f"Error loading batch: {e}")
+                batch = None
+            if batch is not None:
+                yield batch
 
 def create_subspace_moments_dataloader(zarr_path: str, batch_size: int = None, 
                                       shuffle: bool = True, transform=None, num_workers: int = 0,

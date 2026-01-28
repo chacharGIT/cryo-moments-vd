@@ -312,10 +312,14 @@ class ChunkShuffleIterableDataset(IterableDataset):
             chunk_ptr_per_vol[vid] = ptr
             offset_in_chunk_per_vol[vid] = offset
 
-            # Fetch and yield batch
-            batch = self.dataset[batch_indices]
-            if self.device is not None:
-                batch = to_device(batch, self.device)
+            try:
+                # Fetch and yield batch
+                batch = self.dataset[batch_indices]
+                if self.device is not None:
+                    batch = to_device(batch, self.device)
+            except Exception as e:
+                print(f"Error fetching batch for volume {vid}: {type(e).__name__}: {e}")
+                continue
             yield batch
 
 def create_subspace_moments_dataloader(zarr_path: str, batch_size: int = None, 

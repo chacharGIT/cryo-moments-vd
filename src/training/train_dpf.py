@@ -21,6 +21,7 @@ def train():
     else:
         device = torch.device('cpu')
 
+    batch_size = settings.training.batch_size
     use_conditional = settings.dpf.conditional_moment_encoder.use_encoder
     separate_fourier_modes = settings.data_generation.separate_fourier_modes
     model = S2ScoreNetwork().to(device)
@@ -29,10 +30,6 @@ def train():
     points = torch.from_numpy(points).float().to(device)  # [n_points, 3]
 
     if use_conditional:
-        ## Freeze all model weights only for conditional training
-        #for param in model.parameters():
-        #    param.requires_grad = False
-
         # Load per-volume rotations
         emdb_volumes_rotations_np = np.load(
             settings.data_generation.emdb.volume_rotations_path,
@@ -54,35 +51,7 @@ def train():
                 device=device,
                 dtype=points.dtype,
             )
-    optimizer = torch.optim.Adam(model.parameters(), lr=settings.training.learning_rate)
     
-    # Load model parameters
-    ckpt_path = settings.model.checkpoint.load_path
-    if ckpt_path:
-        ckpt_path = os.path.expanduser(ckpt_path)
-        if os.path.isfile(ckpt_path):
-            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-            ckpt_state = checkpoint['model_state_dict']
-            model_state = model.state_dict()
-
-            # keep only keys that exist in current model AND have the same shape
-            filtered_state = {}
-            for k, v in ckpt_state.items():
-                if k in model_state and v.shape == model_state[k].shape:
-                    filtered_state[k] = v
-                else:
-                    print(f"[CKPT] skipping key due to shape mismatch or missing: {k} "
-                          f"ckpt={tuple(v.shape)} "
-                          f"model={tuple(model_state.get(k, torch.empty(0)).shape)}")
-            model_state.update(filtered_state)
-            model.load_state_dict(model_state, strict=False)  
-
-            #model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-            #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"Loaded model parameters from {ckpt_path} (strict=False)")
-        else:
-            print(f"Model parameters file not found at {ckpt_path}")
-    batch_size = settings.training.batch_size
     if not use_conditional:
         zarr_path = os.path.join(settings.data_generation.zarr.save_dir, "vmf_mixtures_evaluations.zarr")
         z = zarr.open(zarr_path, mode='r')
@@ -97,6 +66,7 @@ def train():
         train_indices = indices[:train_size]
         val_indices = indices[train_size:]
         print("[INFO] Using standard (non-conditional) model for training.")
+        optim_params = model.parameters()
     else:
         batch_log_interval = settings.dpf.conditional_moment_encoder.batch_log_interval
 
@@ -122,6 +92,46 @@ def train():
                 D=D
             ).to(device)
             print("[INFO] Using conditional FULL moment encoder for training.")
+
+    # Load model parameters
+    ckpt_path = settings.model.checkpoint.load_path
+    if ckpt_path:
+        ckpt_path = os.path.expanduser(ckpt_path)
+        if os.path.isfile(ckpt_path):
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+            ckpt_state = checkpoint['model_state_dict']
+            model_state = model.state_dict()
+
+            # keep only keys that exist in current model AND have the same shape
+            filtered_state = {}
+            for k, v in ckpt_state.items():
+                if k in model_state and v.shape == model_state[k].shape:
+                    filtered_state[k] = v
+                else:
+                    print(f"[CKPT] skipping key due to shape mismatch or missing: {k} "
+                        f"ckpt={tuple(v.shape)} "
+                        f"model={tuple(model_state.get(k, torch.empty(0)).shape)}")
+            model_state.update(filtered_state)
+            model.load_state_dict(model_state, strict=False)
+            if use_conditional: 
+                if 'cond_encoder_state_dict' in checkpoint:
+                    cond_encoder.load_state_dict(checkpoint['cond_encoder_state_dict'], strict=False)
+                # Freeze all model weights only for conditional training
+                for param in model.parameters():
+                    param.requires_grad = False
+                for param in model.perceiver.cond_cross_attn_layers.parameters():
+                    param.requires_grad = True
+                optim_params = (
+                    [p for p in model.parameters() if p.requires_grad] +
+                    list(cond_encoder.parameters())
+                )
+                optimizer = torch.optim.Adam(optim_params, lr=settings.training.learning_rate)
+
+            #model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print(f"Loaded model parameters from {ckpt_path} (strict=False)")
+        else:
+            print(f"Model parameters file not found at {ckpt_path}")
 
     def batch_provider(batch_size=batch_size):
         if not use_conditional:
@@ -231,7 +241,7 @@ def train():
         loss.backward()
         optimizer.step()
         return loss.item(), pred_score, final_true_score
-    def debug_and_save(avg_loss, pred_score, true_score, model, optimizer, epoch=None, batch_index=None, avg_train_wait_count=None):
+    def debug_and_save(avg_loss, pred_score, true_score, model, optimizer,cond_encoder=None, epoch=None, batch_index=None, avg_train_wait_count=None):
         if not use_conditional:
             print(f"Epoch {epoch+1}/{settings.training.num_epochs} | Loss: {avg_loss:.6f}")
         else:
@@ -261,6 +271,7 @@ def train():
             checkpoint_path = settings.model.checkpoint.save_path.replace('.pth', f'_batch_{batch_index}.pth')
             torch.save({
                 'model_state_dict': model.state_dict(),
+                'cond_encoder_state_dict': cond_encoder.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss
             }, checkpoint_path)
@@ -316,7 +327,7 @@ def train():
                     wait_count += 1
                     if batch_idx % batch_log_interval == 0 and (not batch_idx == 0) and (not saved_on_current_batch):
                         avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
-                        debug_and_save(avg_interval_loss, pred_score, true_score, model, optimizer, batch_index=batch_idx)
+                        debug_and_save(avg_interval_loss, pred_score, true_score, model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
                         saved_on_current_batch = True
             train_wait_counts.append(wait_count)
             loss, pred_score, true_score = train_on_batch(current_batch, model, cond_encoder,
@@ -330,7 +341,7 @@ def train():
             current_batch = next_batch
             if batch_idx % batch_log_interval == 0 and (not batch_idx == 0):
                 avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
-                debug_and_save(avg_interval_loss, pred_score, true_score, model, optimizer, batch_index=batch_idx)
+                debug_and_save(avg_interval_loss, pred_score, true_score, model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
         stop_event.set()
         prefetch_thread.join()
     else:

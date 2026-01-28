@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
 from functools import wraps
 
@@ -76,7 +77,6 @@ class Attention(nn.Module):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = context_dim if context_dim is not None else query_dim
-        self.scale = dim_head ** -0.5
         self.heads = heads
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
@@ -84,28 +84,34 @@ class Attention(nn.Module):
         self.to_out = nn.Linear(inner_dim, query_dim)
 
     def forward(self, x, context=None, mask=None):
+        """
+        x:       [B, N_q, query_dim]
+        context: [B, N_k, context_dim] or None (then context = x)
+        mask:    [B, N_k] bool, True = keep, False = pad
+        """
         h = self.heads
-        q = self.to_q(x)
         context = context if context is not None else x
+        q = self.to_q(x)
         k, v = self.to_kv(context).chunk(2, dim=-1)
 
         # Rearrange for multi-head attention
-        q = rearrange(q, 'b n (h d) -> (b h) n d', h=h)
-        k = rearrange(k, 'b n (h d) -> (b h) n d', h=h)
-        v = rearrange(v, 'b n (h d) -> (b h) n d', h=h)
+        q = rearrange(q, 'b n (h d) -> b h n d', h=h)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=h)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=h)
 
-        # Scaled dot-product attention
-        sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
-
+        attn_mask = None
         if mask is not None:
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
+            # mask: True = valid, False = pad -> attn_mask True = mask out
+            # shape [B,1,1,N_k] will broadcast to [B,H,N_q,N_k]
+            attn_mask = (~mask).unsqueeze(1).unsqueeze(1)
 
-        attn = sim.softmax(dim=-1)
-        out = torch.einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=0.05 if self.training else 0.0,
+            is_causal=False,
+        )  
+        out = rearrange(out, 'b h n d -> b n (h d)', h=h)
         return self.to_out(out)
 
 class PreNorm(nn.Module):
@@ -152,12 +158,9 @@ class PerceiverIO(nn.Module):
                  seq_dropout_prob,
                  logits_dim=None,
                  ff_mult=4,
-                 cond_dim=None,
-                 weight_tie_layers=False,
+                 p_drop_cond=0.1
                  ):
         super().__init__()
-        # Xavier initialization for all Linear layers
-        self.apply(xavier_init_linear)
         self.seq_dropout_prob = seq_dropout_prob
         self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
         self.cross_attend_blocks = nn.ModuleList([
@@ -168,7 +171,7 @@ class PerceiverIO(nn.Module):
         get_latent_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim, mult=ff_mult))
         get_latent_attn, get_latent_ff = map(cache_fn, (get_latent_attn, get_latent_ff))
         self.layers = nn.ModuleList([])
-        cache_args = {'_cache': weight_tie_layers}
+        cache_args = {'_cache': False}
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 get_latent_attn(**cache_args),
@@ -179,53 +182,54 @@ class PerceiverIO(nn.Module):
         self.to_logits = nn.Linear(queries_dim, logits_dim) if exists(logits_dim) else nn.Identity()
         # Learnable scaling for function value channels (assumed last channel)
         self.func_scale = nn.Parameter(torch.ones(1) * 1e3)
-        
-        if exists(cond_dim):
-            self.cond_to_latent = nn.Sequential(
-                nn.Linear(cond_dim, cond_dim * 2),
-                GEGLU(),
-                nn.Linear(cond_dim, latent_dim * 2),
-                GEGLU(),
-                nn.Linear(latent_dim, latent_dim)
+
+        self.p_drop_cond = p_drop_cond
+        self.cond_cross_attn_layers = nn.ModuleList([
+            PreNorm(
+                latent_dim,
+                Attention(
+                    query_dim=latent_dim,
+                    context_dim=latent_dim,
+                    heads=cross_heads,
+                    dim_head=cross_dim_head,
+                ),
+                context_dim=latent_dim,
             )
+            for _ in range(depth+1)
+        ])
+
+        # Xavier initialization for all Linear layers
+        self.apply(xavier_init_linear)
 
     def forward(self, data, mask=None, queries=None, cond_feat=None):
         b = data.shape[0]
         # Apply learnable scaling to function value channels (last channel)
-        if cond_feat is not None:
-            func_data = data[..., -1:] * self.func_scale + cond_feat.unsqueeze(-1)
-        else:
-            func_data = data[..., -1:] * self.func_scale
+        func_data = data[..., -1:] * self.func_scale
         data = torch.cat([data[..., :-1], func_data], dim=-1)
 
         x = repeat(self.latents, 'n d -> b n d', b=b)
         # Additive conditioning: add cond_feat to latents if provided
         if cond_feat is not None:
-            cond_feat_exp = self.cond_to_latent(cond_feat).unsqueeze(1).expand(-1, x.shape[1], -1)
-            x = x + cond_feat_exp
+            if self.training and torch.rand(()) < self.p_drop_cond:
+                cond_feat = None
         cross_attn, cross_ff = self.cross_attend_blocks
         if self.training and self.seq_dropout_prob > 0.:
             data, mask = dropout_seq(data, mask, self.seq_dropout_prob)
         x = cross_attn(x, context=data, mask=mask) + x
         if cond_feat is not None:
-            x = x + cond_feat_exp
+                x = self.cond_cross_attn_layers[0](x, context=cond_feat) + x
         x = cross_ff(x) + x
-        if cond_feat is not None:
-            x = x + cond_feat_exp
-        for self_attn, self_ff in self.layers:
+
+        for layer_idx, (self_attn, self_ff) in enumerate(self.layers):
             x = self_attn(x) + x
             if cond_feat is not None:
-                x = x + cond_feat_exp
+                x = self.cond_cross_attn_layers[layer_idx+1](x, context=cond_feat) + x
             x = self_ff(x) + x
-            if cond_feat is not None:
-                x = x + cond_feat_exp
+
         if not exists(queries):
             return x
         if queries.ndim == 2:
             queries = repeat(queries, 'n d -> b n d', b=b)
-        # Optionally inject cond_feat before decoder cross-attn
-        if cond_feat is not None:
-            x = x + cond_feat_exp
         latents = self.decoder_cross_attn(queries, context=x)
         if exists(self.decoder_ff):
             latents = latents + self.decoder_ff(latents)

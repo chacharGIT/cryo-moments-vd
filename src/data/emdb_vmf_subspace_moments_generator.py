@@ -1,6 +1,4 @@
 import warnings
-
-from sympy import use
 # Suppress Zarr warnings about Python type strings
 warnings.filterwarnings("ignore", category=UserWarning, module="zarr")
 warnings.filterwarnings("ignore", message=".*object arrays.*", category=FutureWarning)
@@ -10,13 +8,13 @@ from tqdm import tqdm
 import zarr
 import numpy as np
 import torch
-from src.data.emdb_downloader import search_emdb_asymmetric_ids, download_emdb_map, load_aspire_volume
-from src.utils.von_mises_fisher_distributions import generate_random_vmf_parameters
-from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution, fibonacci_sphere_points
-from src.utils.von_mises_fisher_distributions import evaluate_vmf_mixture
+
+from config.config import settings
+from src.utils.distribution_generation_functions import fibonacci_sphere_points
+from src.utils.von_mises_fisher_distributions import evaluate_vmf_mixture, generate_random_vmf_parameters
 from src.core.volume_distribution_model import VolumeDistributionModel
 from src.utils.subspace_moment_utils import compute_second_moment_eigendecomposition, num_components_for_energy_threshold, extract_dominant_eigenvector_modes
-from config.config import settings
+from src.utils.polar_transform import cartesian_to_polar
 
 def main():
     # Generate quadrature points once
@@ -44,10 +42,12 @@ def main():
         all_eigen_radial_profiles = []
         all_eigen_m_detected = []
         all_eigen_energy_fractions = []
+        all_first_moments_radial = []
+        n_theta = settings.data_generation.cartesian_to_polar_n_theta
     else:
         all_eigen_images = []
+        all_first_moments = []
     all_eigen_values = []
-    all_first_moments = []
     all_volume_ids = []
     all_distribution_evaluations = []
     total_samples = 0
@@ -134,6 +134,9 @@ def main():
             eigvecs_keep = eigvecs[:, :n_eigen_target]
 
             if separate_fourier_modes:
+                polar, _ , _ = cartesian_to_polar(first_moment, n_theta=n_theta)
+                first_moment_radial = polar.mean(axis=-1).astype(np.float32)
+                all_first_moments_radial.append(first_moment_radial)
                 compressed_eigenspaces = extract_dominant_eigenvector_modes(eigvecs_keep)
                 # Determine radial profile length from first eigenvector
                 if compressed_eigenspaces[0]['m_detected'] == 0:
@@ -173,7 +176,6 @@ def main():
                         "s2_distribution_kappas": all_kappas,
                         "s2_distribution_weights": all_weights,
                         "eigen_values": all_eigen_values,
-                        "first_moments": all_first_moments,
                         "volume_ids": all_volume_ids,
                         "distribution_evaluations": all_distribution_evaluations,
                 }
@@ -182,9 +184,13 @@ def main():
                         "eigen_radial_profiles": all_eigen_radial_profiles,
                         "eigen_m_detected": all_eigen_m_detected,
                         "eigen_energy_fractions": all_eigen_energy_fractions,
+                        "first_moments_radial": all_first_moments_radial,
                     })
                 else:
-                    data_dict.update({"eigen_images": all_eigen_images})
+                    data_dict.update({
+                        "eigen_images": all_eigen_images,
+                        "first_moments": all_first_moments,
+                    })
                 _flush_to_zarr(volume_group, data_dict)
 
                 if separate_fourier_modes:

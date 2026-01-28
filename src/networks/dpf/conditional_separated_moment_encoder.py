@@ -145,13 +145,11 @@ class CryoMomentsConditionalEncoder(nn.Module):
             n_queries_per_m=n_queries_per_m_post, project_back=False)
 
         self.reduce_activation = nn.GELU()
-        out_dim = settings.dpf.conditional_separated_moment_encoder.out_dim
-        hidden_dim = int(np.ceil(out_dim ** (1/3)))
-        self.reduce_T = nn.Linear(self.T, int(hidden_dim))
-        self.reduce_D = nn.Linear(self.D, int(hidden_dim))   
-        self.reduce_R = nn.Linear(self.R, int(hidden_dim))
-        self.final_linear = nn.Linear(hidden_dim ** 3, out_dim)
-
+        self.latent_dim = settings.dpf.perceiver.latent_dim
+        self.num_cond_queries = settings.dpf.conditional_separated_moment_encoder.num_cond_queries
+        self.reduce_R = nn.Linear(self.R, self.latent_dim)
+        self.reduce_TD = nn.Linear(self.T * self.D, self.num_cond_queries)
+        
     def forward(self, second_moment_radial_subspace, second_moment_eigen_values, first_moment_radial, mask_dict):
         """
         Args:
@@ -202,21 +200,13 @@ class CryoMomentsConditionalEncoder(nn.Module):
                 x2[k] = x2[k] + delta[k]    
         x2 = self.last_cyclic_block(x2) # [B, T, D, R]
 
-        # ---- axis-wise reductions: [B, T, D, R] -> [B, out_dim] ----
-        B = x2.shape[0]
-
-        # Reduce T,D,R axes sequentially
-        x = x2.permute(0, 2, 3, 1)       # [B, D, R, T]
-        x = self.reduce_T(x)             # [B, D, R, h]
+        # axis-wise reductions: [B, T, D, R] -> [B, num_cond_queries, latent_dim]
+        B, T, D, R = x2.shape
+        x = x2.reshape(B, T * D, R)
+        x = self.reduce_R(x) # [B, T*D, latent_dim]
         x = self.reduce_activation(x)
-        x = x.permute(0, 3, 2, 1)        # [B, h, R, D]
-        x = self.reduce_D(x)             # [B, h, R, h]
-        x = self.reduce_activation(x)
-        x = x.permute(0, 1, 3, 2)        # [B, h, h, R]
-        x = self.reduce_R(x)             # [B, h, h, h]
-        x = self.reduce_activation(x)
-        # Flatten and final linear: [B, h^3] -> [B, out_dim]
-        x = x.reshape(B, -1)             # [B, h^3]
-        cond_feat = self.final_linear(x) # [B, out_dim]
+        x = x.permute(0, 2, 1)
+        x = self.reduce_TD(x) # [B, latent_dim, num_cond_queries]
+        cond_feat = x.permute(0, 2, 1)
         return cond_feat
     
