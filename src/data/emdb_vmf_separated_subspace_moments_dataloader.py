@@ -89,7 +89,7 @@ class EMDBvMFSubspaceMomentsDataset(Dataset):
         self.allowed_m = set(int(m) for m in np.arange(len(n_vectors_per_m)))
 
         if debug:
-            print(f"Found {len(self.volume_ids)} volumes. Mode={mode}")
+            print(f"Mode '{mode}': {len(self.volume_ids)} volumes loaded (split file: {split_path})")
             print(f"Angular frequency band limit: m={n_vectors_per_m.shape[0]}")
     
     def __len__(self) -> int:

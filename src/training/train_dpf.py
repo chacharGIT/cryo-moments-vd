@@ -7,11 +7,12 @@ import threading
 import queue
 
 from config.config import settings
+from src.data.emdb_downloader import load_aspire_volume
 from src.utils.distribution_generation_functions import fibonacci_sphere_points
 from src.networks.dpf.sample_generation import build_network_input
 from src.networks.dpf.score_network import S2ScoreNetwork
 from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_schedule
-from src.networks.dpf.loss import dpf_score_matching_loss
+from src.networks.dpf.loss import dpf_score_matching_loss, partial_moment_loss
 from src.networks.dpf.torch_utils import rotate_s2_function_interpolated
 
 def train():
@@ -24,7 +25,7 @@ def train():
     batch_size = settings.training.batch_size
     use_conditional = settings.dpf.conditional_moment_encoder.use_encoder
     separate_fourier_modes = settings.data_generation.separate_fourier_modes
-    model = S2ScoreNetwork().to(device)
+    score_model = S2ScoreNetwork().to(device)
     quadrature_n = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
     points = fibonacci_sphere_points(quadrature_n)
     points = torch.from_numpy(points).float().to(device)  # [n_points, 3]
@@ -66,7 +67,7 @@ def train():
         train_indices = indices[:train_size]
         val_indices = indices[train_size:]
         print("[INFO] Using standard (non-conditional) model for training.")
-        optim_params = model.parameters()
+        optim_params = score_model.parameters()
     else:
         batch_log_interval = settings.dpf.conditional_moment_encoder.batch_log_interval
 
@@ -100,35 +101,47 @@ def train():
         if os.path.isfile(ckpt_path):
             checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
             ckpt_state = checkpoint['model_state_dict']
-            model_state = model.state_dict()
-
+            score_model_state = score_model.state_dict()
             # keep only keys that exist in current model AND have the same shape
-            filtered_state = {}
+            score_model_filtered_state = {}
             for k, v in ckpt_state.items():
-                if k in model_state and v.shape == model_state[k].shape:
-                    filtered_state[k] = v
+                if k in score_model_state and v.shape == score_model_state[k].shape:
+                    score_model_filtered_state[k] = v
                 else:
                     print(f"[CKPT] skipping key due to shape mismatch or missing: {k} "
                         f"ckpt={tuple(v.shape)} "
-                        f"model={tuple(model_state.get(k, torch.empty(0)).shape)}")
-            model_state.update(filtered_state)
-            model.load_state_dict(model_state, strict=False)
-            if use_conditional: 
-                if 'cond_encoder_state_dict' in checkpoint:
-                    cond_encoder.load_state_dict(checkpoint['cond_encoder_state_dict'], strict=False)
+                        f"model={tuple(score_model_state.get(k, torch.empty(0)).shape)}")
+            score_model_state.update(score_model_filtered_state)
+            score_model.load_state_dict(score_model_state, strict=False)
+            if use_conditional and 'cond_encoder_state_dict' in checkpoint:
+                cond_model_filtered_state = {}
+                cond_ckpt_state = checkpoint['cond_encoder_state_dict']
+                cond_model_state = cond_encoder.state_dict()
+                for k, v in cond_ckpt_state.items():
+                    if k in cond_model_state and v.shape == cond_model_state[k].shape:
+                        cond_model_filtered_state[k] = v
+                    else:
+                        print(f"[CKPT] skipping cond_encoder key due to shape mismatch or missing: {k} "
+                            f"ckpt={tuple(v.shape)} "
+                            f"model={tuple(cond_model_state.get(k, torch.empty(0)).shape)}")
+                cond_model_state.update(cond_model_filtered_state)
+                cond_encoder.load_state_dict(cond_model_state, strict=False)
+
                 # Freeze all model weights only for conditional training
-                for param in model.parameters():
+                for param in score_model.parameters():
                     param.requires_grad = False
-                for param in model.perceiver.cond_cross_attn_layers.parameters():
+                for param in score_model.perceiver.cond_cross_attn_layers.parameters():
+                    param.requires_grad = True
+                for param in score_model.perceiver.cond_scales.parameters():
                     param.requires_grad = True
                 optim_params = (
-                    [p for p in model.parameters() if p.requires_grad] +
+                    [p for p in score_model.parameters() if p.requires_grad] +
                     list(cond_encoder.parameters())
                 )
-                optimizer = torch.optim.Adam(optim_params, lr=settings.training.learning_rate)
-
-            #model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-            #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            else:
+                optim_params = [p for p in score_model.parameters() if p.requires_grad]
+            optimizer = torch.optim.Adam(optim_params, lr=settings.training.learning_rate)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print(f"Loaded model parameters from {ckpt_path} (strict=False)")
         else:
             print(f"Model parameters file not found at {ckpt_path}")
@@ -179,6 +192,14 @@ def train():
         batch_func = batch_func / (batch_func.std(dim=1, keepdim=True))
         current_batch_size = batch_func.shape[0]
         t = torch.rand(current_batch_size, device=batch_func.device)
+        if use_conditional:
+            volume_id = batch["volume_id"][0]
+            R_vol_np = emdb_volumes_rotations[volume_id]["rotation"]
+            R_vol = torch.from_numpy(R_vol_np).float().to(device)
+            R_inv = R_vol.t()
+            batch_func = rotate_s2_function_interpolated(
+                points, batch_func, R_inv
+            )
         x_t = q_sample(batch_func, t)
         context_encoding = build_network_input(
             points, t, x_t,
@@ -215,10 +236,6 @@ def train():
 
         # Rotate predicted score on S^2 using the per-volume rotation (conditional case)
         if use_conditional:
-            volume_id = batch["volume_id"][0]
-            R_vol_np = emdb_volumes_rotations[volume_id]["rotation"]
-            R_vol = torch.from_numpy(R_vol_np).float().to(device)
-            R_inv = R_vol.t()
             candidate_targets = []
             candidate_losses = []
 
@@ -237,6 +254,19 @@ def train():
         else:
             final_true_score = true_score
             loss = dpf_score_matching_loss(pred_score, final_true_score)
+
+        aspire_volume = load_aspire_volume(
+            settings.data_generation.emdb.download_folder + "/" + batch['volume_id'][0] + ".map.gz",
+            downsample_size=settings.data_generation.downsample_size,
+        )
+        pred_distribution = ((1 - scaling_t) * pred_score + x_t)/torch.sqrt(scaling_t)
+        loss += partial_moment_loss(
+            volume=aspire_volume,
+            back_rotation=R_inv.T,
+            pred_distribution=pred_distribution,
+            true_distribution=batch_func,
+            points=points,
+        )
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -316,7 +346,7 @@ def train():
                     break
                 except queue.Empty:
                     # No new batch available, train again on current_batch
-                    loss, pred_score, true_score = train_on_batch(current_batch, model, cond_encoder,
+                    loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
                                                                     device, points, optimizer)
                     if loss is None:
                         current_batch = next_batch
@@ -327,10 +357,10 @@ def train():
                     wait_count += 1
                     if batch_idx % batch_log_interval == 0 and (not batch_idx == 0) and (not saved_on_current_batch):
                         avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
-                        debug_and_save(avg_interval_loss, pred_score, true_score, model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
+                        debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
                         saved_on_current_batch = True
             train_wait_counts.append(wait_count)
-            loss, pred_score, true_score = train_on_batch(current_batch, model, cond_encoder,
+            loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
                                                             device, points, optimizer)
             if loss is None:
                 current_batch = next_batch
@@ -341,7 +371,7 @@ def train():
             current_batch = next_batch
             if batch_idx % batch_log_interval == 0 and (not batch_idx == 0):
                 avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
-                debug_and_save(avg_interval_loss, pred_score, true_score, model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
+                debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
         stop_event.set()
         prefetch_thread.join()
     else:
@@ -351,11 +381,11 @@ def train():
             total_batches = int(train_size // batch_size) + int(train_size % batch_size != 0)
             progress_bar = tqdm(batch_provider(batch_size), desc=f"Epoch {epoch+1}", total=total_batches, leave=False)
             for batch in progress_bar:
-                loss, pred_score, true_score = train_on_batch(batch, model, None, device, points, optimizer)
+                loss, pred_score, true_score = train_on_batch(batch, score_model, None, device, points, optimizer)
                 running_loss += loss
                 num_batches += 1
             avg_loss = running_loss / max(1, num_batches)
-            debug_and_save(avg_loss, pred_score, true_score, model, optimizer, epoch=epoch)
+            debug_and_save(avg_loss, pred_score, true_score, score_model, optimizer, epoch=epoch)
 
 if __name__ == '__main__':
     train()

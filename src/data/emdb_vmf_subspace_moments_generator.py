@@ -160,11 +160,11 @@ def main():
                 all_eigen_radial_profiles.append(radial_profiles)
             else:
                 all_eigen_images.append(eigvecs_keep)
+                all_first_moments.append(first_moment)
             all_means.append(mu)
             all_kappas.append(kappa)
             all_weights.append(weights)
             all_eigen_values.append(eigvals_keep)
-            all_first_moments.append(first_moment)
             all_volume_ids.append(emdb_id)
             all_distribution_evaluations.append(mixture_eval)
             total_samples += 1
@@ -199,11 +199,11 @@ def main():
                     all_eigen_energy_fractions.clear()
                 else:
                     all_eigen_images.clear()
+                    all_first_moments.clear()
                 all_means.clear()
                 all_kappas.clear()
                 all_weights.clear()
                 all_eigen_values.clear()
-                all_first_moments.clear()
                 all_volume_ids.clear()
                 all_distribution_evaluations.clear()
 

@@ -197,6 +197,9 @@ class PerceiverIO(nn.Module):
             )
             for _ in range(depth+1)
         ])
+        self.cond_scales = nn.ParameterList([
+            nn.Parameter(torch.tensor(1.0)) for _ in range(depth + 1)
+        ])
 
         # Xavier initialization for all Linear layers
         self.apply(xavier_init_linear)
@@ -217,13 +220,13 @@ class PerceiverIO(nn.Module):
             data, mask = dropout_seq(data, mask, self.seq_dropout_prob)
         x = cross_attn(x, context=data, mask=mask) + x
         if cond_feat is not None:
-                x = self.cond_cross_attn_layers[0](x, context=cond_feat) + x
+                x = x + self.cond_scales[0] * self.cond_cross_attn_layers[0](x, context=cond_feat)
         x = cross_ff(x) + x
 
         for layer_idx, (self_attn, self_ff) in enumerate(self.layers):
             x = self_attn(x) + x
             if cond_feat is not None:
-                x = self.cond_cross_attn_layers[layer_idx+1](x, context=cond_feat) + x
+                x = x + self.cond_scales[layer_idx + 1] * self.cond_cross_attn_layers[layer_idx+1](x, context=cond_feat)
             x = self_ff(x) + x
 
         if not exists(queries):
