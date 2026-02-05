@@ -1,6 +1,9 @@
 import torch
+import numpy as np
+from aspire.utils.rotation import Rotation
 
 from config.config import settings
+from src.utils.distribution_generation_functions import cartesian_to_spherical, spherical_to_cartesian
 
 def linear_beta_schedule(timesteps, beta_start, beta_end):
     """
@@ -26,7 +29,8 @@ def cosine_beta_schedule(timesteps, s):
 
 def rotate_s2_function_interpolated(grid_points, rho, R):
     """
-    Rotate a scalar function on S^2 by R using nearest neighbour exponential kernel interpolation.
+    Rotate in plane invariant euler angle distribution by R,
+      using nearest neighbour exponential kernel interpolation.
 
     Parameters
     ----------
@@ -45,25 +49,38 @@ def rotate_s2_function_interpolated(grid_points, rho, R):
     k = settings.dpf.output_rotation_interpolation.num_k
     alphas = settings.dpf.output_rotation_interpolation.alphas
 
-    if grid_points.ndim != 2 or grid_points.shape[1] != 3:
+    if isinstance(grid_points, torch.Tensor):
+        grid_points_np = grid_points.cpu().numpy()
+    else:
+        grid_points_np = grid_points
+    if grid_points_np.ndim != 2 or grid_points_np.shape[1] != 3:
         raise ValueError(f"grid_points must have shape (N, 3), got {grid_points.shape}")
-    N = grid_points.shape[0]
+    N = grid_points_np.shape[0]
     if rho.ndim != 2 or rho.shape[1] != N:
         raise ValueError(f"rho must have shape (B, N), got {rho.shape} for N={grid_points.shape[0]}")
 
     device = grid_points.device
     dtype = grid_points.dtype
     rho = rho.to(device=device, dtype=dtype)
-    R = R.to(device=device, dtype=dtype)
-
     N = grid_points.shape[0]
     k = min(k, N)
 
-    # x_j = R^T @ x_j; with row vectors this is x^T_j @ R
-    eval_points = grid_points @ R  # (N, 3)
+    # Convert grid points to eval_points using left rotation on euler angles
+    #  with invariance to third euler angle.
+    spherical_grid_points = cartesian_to_spherical(grid_points_np)  # shape (N, 2)
+    phi = spherical_grid_points[:, 0]
+    theta = spherical_grid_points[:, 1]
+    euler_angles = np.stack([phi, theta, np.zeros_like(phi)], axis=1)  # (N, 3)
+    rots = Rotation.from_euler(euler_angles, dtype=np.float64) # (N, 3, 3)
+    rotated_matrices = np.matmul(R[None, :, :], rots.matrices)  # (N, 3, 3)
+    rotated_eulers = Rotation(rotated_matrices).angles  # (N, 3)
+    a = rotated_eulers[:, 0]
+    b = rotated_eulers[:, 1]
+    eval_points = spherical_to_cartesian(np.stack([a, b], axis=1))
+    eval_points_torch = torch.from_numpy(eval_points).to(device=device, dtype=dtype)
 
     # Pointwise dot-products between eval points and grid points
-    sims = grid_points @ eval_points.t()  # (N, N)
+    sims = grid_points @ eval_points_torch.t()  # (N, N)
 
     # k nearest neighbours per column j (largest dot-products)
     vals, idx = torch.topk(sims, k=k, dim=0)  # vals, idx: (k, N)
@@ -89,5 +106,18 @@ def rotate_s2_function_interpolated(grid_points, rho, R):
         rho_rot_list.append(rho_rot_alpha)
 
     rho_rot = torch.stack(rho_rot_list, dim=0).mean(dim=0)  # (B, N)
+    """
+    from src.inference.sample_from_dpf import plot_s2_comparison
+    plot_s2_comparison(
+        grid_points, 
+        plot_dict={"rho on grid_points": rho[0],
+                    "rho_rot on grid_points": rho_rot[0]},
+        save_path='outputs/tmp_figs/rotated_s2_function_comparison.png')
 
+    # Plot on eval_points
+    plot_s2_comparison(
+        eval_points_torch,
+          plot_dict={"rho_rot on eval_points": rho[0]},
+          save_path='outputs/tmp_figs/rotated_s2_function_on_eval_points.png')
+    """
     return rho_rot

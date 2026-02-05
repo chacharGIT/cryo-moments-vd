@@ -1,9 +1,6 @@
 import numpy as np
-from aspire.image import Image
-from aspire.volume import Volume
-import matplotlib.pyplot as plt
-from aspire.utils.rotation import Rotation
 
+from aspire.utils.rotation import Rotation
 
 def fibonacci_sphere_points(n: int):
     """
@@ -55,27 +52,26 @@ def cartesian_to_spherical(points):
     phi = np.where(phi < 0, phi + 2 * np.pi, phi)
     return np.column_stack([phi, theta])
 
-def cartesian_to_spherical(points):
+def spherical_to_cartesian(spherical_coords):
     """
-    Convert normalized points in R^3 to spherical coordinates (phi, theta).
-    Assumes input points are normalized (on the unit sphere).
+    Convert spherical coordinates (phi, theta) to Cartesian coordinates (x, y, z).
+    Assumes phi in [0, 2*pi), theta in [0, pi].
 
     Parameters:
     -----------
-    points : ndarray
-        Array of shape (N, 3) representing N points in R^3.
+    spherical_coords : ndarray
+        Array of shape (N, 2), where each row is (phi, theta).
 
     Returns:
     --------
-    spherical_coords : ndarray
-        Array of shape (N, 2), where each row is (phi, theta).
-        phi in [0, 2*pi), theta in [0, pi].
+    cartesian_coords : ndarray
+        Array of shape (N, 3), where each row is (x, y, z).
     """
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    theta = np.arccos(np.clip(z, -1, 1))
-    phi = np.arctan2(y, x)
-    phi = np.where(phi < 0, phi + 2 * np.pi, phi)
-    return np.column_stack([phi, theta])
+    phi, theta = spherical_coords[:, 0], spherical_coords[:, 1]
+    x = np.sin(theta) * np.cos(phi)
+    y = np.sin(theta) * np.sin(phi)
+    z = np.cos(theta)
+    return np.column_stack([x, y, z])
 
 def generate_random_s2_points(num_points):
     """

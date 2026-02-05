@@ -53,7 +53,6 @@ def rotation_from_second_moment(C):
 
     # Sort eigenvalues descending and reorder eigenvectors accordingly
     idx = np.argsort(vals)[::-1]
-    lambdas = vals[idx]
     R_p = vecs[:, idx].copy()  # columns v1, v2, v3
 
     # Fix signs of first two eigenvectors by their largest-magnitude entry

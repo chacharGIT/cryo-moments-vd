@@ -3,6 +3,7 @@ from typing import Tuple, Optional, Union, Any
 from aspire.volume import Volume
 from aspire.utils.rotation import Rotation
 
+from config.config import settings
 from src.core.volume_distribution_model import VolumeDistributionModel
 from src.utils.distribution_generation_functions import (
     fibonacci_sphere_points, 
@@ -13,8 +14,6 @@ from src.utils.von_mises_fisher_distributions import (
     generate_random_vmf_parameters,
     so3_distribution_from_vmf
 )
-from config.config import settings
-
 
 def generate_vdm_from_volume(
     volume: Volume,

@@ -1,4 +1,5 @@
 import torch
+
 from config.config import settings
 
 def von_mises_fisher_normalization_constant(kappa, kappa_clamp_max=None):

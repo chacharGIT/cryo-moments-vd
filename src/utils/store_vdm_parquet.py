@@ -4,14 +4,14 @@ import pickle
 import pyarrow as pa
 import pyarrow.parquet as pq
 from aspire.downloader import emdb_2660
+
+from config.config import settings
 from src.core.volume_distribution_model import VolumeDistributionModel
 from src.utils.distribution_generation_functions import fibonacci_sphere_points
-from von_mises_fisher_distributions import (
+from src.utils.von_mises_fisher_distributions import (
     generate_random_vmf_parameters,
     so3_distribution_from_vmf
 )
-from config.config import settings
-
 
 def save_vdm_pickle(vdm: VolumeDistributionModel, output_path):
     """

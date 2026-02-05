@@ -101,7 +101,7 @@ def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_s
     x_curr = dpm_solver_ode.sample(x_curr, steps=solver_steps, t_start=t0.item(), t_end=tN.item(), order=min(3, solver_steps), skip_type='time_uniform', method='multistep')
     return x_curr
 
-def plot_s2_comparison(points, plot_dict, t=None):
+def plot_s2_comparison(points, plot_dict, t=None, save_path=None):
     """
     Visualizes multiple S2 functions on the sphere, split by hemisphere.
 
@@ -115,6 +115,8 @@ def plot_s2_comparison(points, plot_dict, t=None):
     The function splits the sphere into two hemispheres (z>0 and z<=0) and plots each function for both hemispheres.
     Color represents function value at each point. Results are saved to 'outputs/tmp_figs/inference_comparison.png'.
     """
+    if save_path is None:
+        save_path = 'outputs/tmp_figs/inference_comparison.png'
     # Accept points as [batch, n_points, 3] or [n_points, 3]
     if torch.is_tensor(points):
         points = points.detach().cpu().numpy()
@@ -123,12 +125,19 @@ def plot_s2_comparison(points, plot_dict, t=None):
     arrs = []
     titles = []
     for k, v in plot_dict.items():
-        arrs.append(v[0].detach().cpu().numpy())
+        if torch.is_tensor(v):
+            v = v.detach().cpu().numpy()
+        if v.ndim == 2 and v.shape[0] == 1:
+            arrs.append(v[0])
+        else:
+            arrs.append(v)
         titles.append(k)
     n_cols = len(arrs)
     mask_top = points[:, 2] > 0
     mask_bottom = points[:, 2] <= 0
     fig, axes = plt.subplots(2, n_cols, figsize=(5*n_cols, 8))
+    if n_cols == 1:
+        axes = axes.reshape(2, 1)
     if t is not None:
         fig.suptitle(f"t = {float(t):.4f}", fontsize=20)
     for row, mask in enumerate([mask_top, mask_bottom]):
@@ -140,7 +149,7 @@ def plot_s2_comparison(points, plot_dict, t=None):
             axes[row, col].set_aspect('equal')
             plt.colorbar(sc, ax=axes[row, col])
     plt.tight_layout()
-    plt.savefig('outputs/tmp_figs/inference_comparison.png')
+    plt.savefig(save_path)
 
 if __name__ == "__main__":
     # Use CUDA if available and allowed by config

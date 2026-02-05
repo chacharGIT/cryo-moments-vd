@@ -1,16 +1,31 @@
-from statistics import variance
-from cvxpy import var
-from sympy import true
 import torch
+import numpy as np
+
 from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution
 from src.core.volume_distribution_model import VolumeDistributionModel
+
+def variance_weighting(base_value, true, pred):
+    """
+    Applies variance-based weighting to a loss function.
+
+    Args:
+        base_value (float): Base loss value to be weighted.
+        true (torch.Tensor): True values.
+        pred (torch.Tensor): Predicted values.
+    Returns:
+        torch.Tensor: Weighted loss value.
+    """
+    var_true = true.var()
+    var_pred = pred.var()
+    weighted_value = 1/2* (base_value / (var_true + 1e-8) + base_value / (var_pred + 1e-8))
+    return weighted_value
 
 def dpf_score_matching_loss(
     pred_score, true_score,
     scale_invariant=True,
     variance_matching=False, lambda_var=2.5,
     correlation_matching=False, lambda_corr=0.3,
-    third_cumulant_matching=True, lambda_cum3=0.15
+    third_cumulant_matching=False, lambda_cum3=0.15
 ):
     """
     Computes the DPF score matching loss between predicted and true scores, with optional regularization terms.
@@ -58,7 +73,7 @@ def dpf_score_matching_loss(
 def partial_moment_loss(
     pred_distribution, true_distribution, volume, back_rotation, points,
      num_sampled_first=64, num_sampled_second=16, num_inplane_rotations=10,
-     lambda_1=2.0, lambda_2=8.0 
+     lambda_1=0.2, lambda_2=0.8 
 ):
     """
     Computes L2 loss between partial second moments of predicted and true distributions,
@@ -80,10 +95,8 @@ def partial_moment_loss(
     Returns:
         torch.Tensor: Scalar loss value
     """
-    points = torch.matmul(points, back_rotation.T)  # Rotate points back
-    N = points.shape[0]
+    max_loss = 1e3
     device = points.device
-
     # Subsample points with probability proportional to mean true_distribution over batch
     probs = true_distribution.mean(dim=0)
     probs = probs / (probs.sum() + 1e-8)
@@ -107,6 +120,8 @@ def partial_moment_loss(
             num_in_plane_rotations=num_inplane_rotations,
             is_s2_uniform=True
         )
+
+        so3_rotations = np.matmul(back_rotation[None, :, :], so3_rotations)
         # Compute second moment component (returns numpy array)
         vdm = VolumeDistributionModel(
             volume, rotations=so3_rotations, distribution=so3_weights, in_plane_invariant_distribution=False)
@@ -118,31 +133,14 @@ def partial_moment_loss(
     first_moment_components = torch.stack(first_moment_components, dim=0)  # [N, ...]
     second_moment_components = torch.stack(second_moment_components, dim=0)  # [num_sampled, ...]
 
-    # Compute weighted sum for first moment
+    # Compute weighted sum for first moment and second moment differences
     weights = pred_distribution[:, idx_first] - true_distribution[:, idx_first]  # [B, N]
     first_moment_diff = torch.einsum('bn,n...->b...', weights, first_moment_components)
     first_moment_loss = first_moment_diff.flatten(1).norm(dim=1).mean()
-
     weights = weights[:, idx_second_in_first]  # [B, num_sampled]
     partial_second_moment_diff = torch.einsum('bn,n...->b...', weights, second_moment_components)
     second_moment_loss = partial_second_moment_diff.flatten(1).norm(dim=1).mean()
 
     base_loss = (lambda_1 * first_moment_loss + lambda_2 * second_moment_loss)
     weighted_loss = variance_weighting(base_loss, true_distribution[:, idx_first], pred_distribution[:, idx_first])
-    return weighted_loss
-
-def variance_weighting(base_value, true, pred):
-    """
-    Applies variance-based weighting to a loss function.
-
-    Args:
-        base_value (float): Base loss value to be weighted.
-        true (torch.Tensor): True values.
-        pred (torch.Tensor): Predicted values.
-    Returns:
-        torch.Tensor: Weighted loss value.
-    """
-    var_true = true.var()
-    var_pred = pred.var()
-    weighted_value = 1/2* (base_value / (var_true + 1e-8) + base_value / (var_pred + 1e-8))
-    return weighted_value
+    return torch.clamp(weighted_loss, max=max_loss)

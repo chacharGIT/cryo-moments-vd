@@ -1,3 +1,4 @@
+from matplotlib.pylab import float32
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -42,16 +43,15 @@ def train():
             for key, value in emdb_volumes_rotations_np.items()
         }
         # Define sign configurations for possible per volume rotations
-        sign_configs = torch.tensor(
-                [
-                    [ 1.0,  1.0,  1.0],  # R
-                    [ 1.0, -1.0, -1.0],  # [R1, -R2, -R3]
-                    [-1.0, -1.0,  1.0],  # [-R1, -R2, R3]
-                    [-1.0,  1.0, -1.0],  # [-R1, R2, -R3]
-                ],
-                device=device,
-                dtype=points.dtype,
-            )
+        sign_configs = np.array(
+            [
+                [ 1.0,  1.0,  1.0],   # R
+                [ 1.0, -1.0, -1.0],   # [R1, -R2, -R3]
+                [-1.0, -1.0,  1.0],   # [-R1, -R2, R3]
+                [-1.0,  1.0, -1.0],   # [-R1, R2, -R3]
+            ],
+            dtype=np.float32  # or np.float64 if you prefer
+        )
     
     if not use_conditional:
         zarr_path = os.path.join(settings.data_generation.zarr.save_dir, "vmf_mixtures_evaluations.zarr")
@@ -141,7 +141,7 @@ def train():
             else:
                 optim_params = [p for p in score_model.parameters() if p.requires_grad]
             optimizer = torch.optim.Adam(optim_params, lr=settings.training.learning_rate)
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print(f"Loaded model parameters from {ckpt_path} (strict=False)")
         else:
             print(f"Model parameters file not found at {ckpt_path}")
@@ -194,9 +194,9 @@ def train():
         t = torch.rand(current_batch_size, device=batch_func.device)
         if use_conditional:
             volume_id = batch["volume_id"][0]
-            R_vol_np = emdb_volumes_rotations[volume_id]["rotation"]
-            R_vol = torch.from_numpy(R_vol_np).float().to(device)
-            R_inv = R_vol.t()
+            R_vol_np = emdb_volumes_rotations[volume_id]["rotation"].astype(np.float32)
+            R_inv = R_vol_np.T
+            batch_func_old = batch_func.clone()
             batch_func = rotate_s2_function_interpolated(
                 points, batch_func, R_inv
             )
@@ -240,7 +240,7 @@ def train():
             candidate_losses = []
 
             for signs in sign_configs:
-                S = torch.diag(signs)
+                S = np.diag(signs)
                 # (R * S)^{-1} = S * R^{-1} for diagonal S with ±1
                 R_inv_variant = S @ R_inv
                 rotated_true_score = rotate_s2_function_interpolated(
@@ -259,6 +259,25 @@ def train():
             settings.data_generation.emdb.download_folder + "/" + batch['volume_id'][0] + ".map.gz",
             downsample_size=settings.data_generation.downsample_size,
         )
+        """
+        from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution
+        from src.core.volume_distribution_model import VolumeDistributionModel
+        so3_rotations, so3_weights = create_in_plane_invariant_distribution(points.cpu().numpy(), batch_func_old[0].cpu().numpy(), 
+                                                                        num_in_plane_rotations=128)
+        V1 =  VolumeDistributionModel(
+            aspire_volume, rotations=so3_rotations, distribution=so3_weights, in_plane_invariant_distribution=False)
+        m11 = V1.first_analytical_moment()
+        m21 = V1.second_analytical_moment(batch_size=50, show_progress=True)
+        so3_rotations, so3_weights = create_in_plane_invariant_distribution(points.cpu().numpy(), batch_func[0].cpu().numpy(), 
+                                                                        num_in_plane_rotations=128)
+        so3_rotations = np.matmul(R_inv.T[None, :, :], so3_rotations)
+        v2 =  VolumeDistributionModel(
+            aspire_volume, rotations=so3_rotations, distribution=so3_weights, in_plane_invariant_distribution=False)
+        m12 = v2.first_analytical_moment()
+        m22 = v2.second_analytical_moment(batch_size=50, show_progress=True)
+        print(np.linalg.norm(m11-m12), np.linalg.norm(m21-m22))
+        raise Exception("Debugging moment mismatch")
+        """
         pred_distribution = ((1 - scaling_t) * pred_score + x_t)/torch.sqrt(scaling_t)
         loss += partial_moment_loss(
             volume=aspire_volume,
