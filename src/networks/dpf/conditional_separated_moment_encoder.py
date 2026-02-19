@@ -161,7 +161,7 @@ class CryoMomentsConditionalEncoder(nn.Module):
         Returns:
             cond_feat (Tensor): [B, output_dim] conditional feature vector for downstream tasks.
         """
-        device = torch.device(f'cuda:{settings.device.cuda_device}')
+        device = first_moment_radial.device
         B = first_moment_radial.shape[0]
         x2 = {}
         for m in range(len(self.n_queries_per_m)):

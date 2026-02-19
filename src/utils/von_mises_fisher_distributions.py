@@ -74,7 +74,7 @@ def evaluate_vmf_pdf(x, mu, kappa):
 
     # Check for NaNs or infs
     if np.any(~np.isfinite(pdf_values)):
-        raise RuntimeError("NaN or Inf encountered in von_mises_fisher_pdf. Check kappa and input values.")
+        raise RuntimeError("NaN or Inf encountered in von_mises_fisher_pdf. Input kappa values: {}".format(kappa))
 
     return pdf_values
 

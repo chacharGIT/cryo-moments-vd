@@ -5,7 +5,6 @@ warnings.filterwarnings(
     category=UserWarning,
     module=r"zarr.codecs.vlen_utf8"
 )
-
 import math
 import torch
 import zarr
@@ -13,9 +12,9 @@ import numpy as np
 import os
 import random
 from torch.utils.data import Dataset, DataLoader, IterableDataset
+import torch.distributed as dist
 
 from config.config import settings
-from src.utils.polar_transform import cartesian_to_polar
 
 class EMDBvMFSubspaceMomentsDataset(Dataset):
     """
@@ -251,7 +250,13 @@ class ChunkShuffleIterableDataset(IterableDataset):
         self.batch_size = batch_size
 
     def __iter__(self):
-        volume_ids = list(self.dataset.volume_to_indices.keys())
+        rank = 0
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        all_volume_ids = list(self.dataset.volume_to_indices.keys())
+        volume_ids = all_volume_ids[rank::world_size]
         n_samples_per_vol = {
             vid: len(self.dataset.volume_to_indices[vid]) for vid in volume_ids
         }
@@ -324,7 +329,7 @@ class ChunkShuffleIterableDataset(IterableDataset):
 
 def create_subspace_moments_dataloader(zarr_path: str, batch_size: int = None, 
                                       shuffle: bool = True, transform=None, num_workers: int = 0,
-                                      debug: bool = False, mode="train") -> DataLoader:
+                                      debug: bool = False, mode="train", device=None) -> DataLoader:
     """
     Create a DataLoader for subspace moments EMDB data with vMF mixtures.
     Uses batch-level Zarr reading for efficiency with large samples.
@@ -342,10 +347,8 @@ def create_subspace_moments_dataloader(zarr_path: str, batch_size: int = None,
     if batch_size is None:
         batch_size = settings.training.batch_size
     dataset = EMDBvMFSubspaceMomentsDataset(zarr_path, transform=transform, debug=debug, mode=mode)
-    if settings.device.use_cuda:
-        device = f"cuda:{settings.device.cuda_device}"
-    else:
-        device = "cpu"
+    if device is None:
+        raise ValueError("Device must be specified for ChunkShuffleIterableDataset.")
     iterable_dataset = ChunkShuffleIterableDataset(dataset, batch_size=batch_size, shuffle=shuffle, device=device)
     dataloader = DataLoader(
         iterable_dataset,

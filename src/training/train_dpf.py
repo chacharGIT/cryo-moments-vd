@@ -1,5 +1,9 @@
-from matplotlib.pylab import float32
+from matplotlib.pylab import f
+from pyparsing import C
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
 import numpy as np
 from tqdm import tqdm
 import os
@@ -16,17 +20,21 @@ from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_s
 from src.networks.dpf.loss import dpf_score_matching_loss, partial_moment_loss
 from src.networks.dpf.torch_utils import rotate_s2_function_interpolated
 
-def train():
-    # torch.autograd.set_detect_anomaly(True)
-    if settings.device.use_cuda and torch.cuda.is_available():
-        device = torch.device(f'cuda:{settings.device.cuda_device}')
-    else:
-        device = torch.device('cpu')
+def train(local_rank):
+    CURRICULUM_SINGLE_EXAMPLE = False
+    if CURRICULUM_SINGLE_EXAMPLE:
+        cached_first_moment = None
+        cached_second_moment = None
+
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f'cuda:{local_rank}')
 
     batch_size = settings.training.batch_size
     use_conditional = settings.dpf.conditional_moment_encoder.use_encoder
     separate_fourier_modes = settings.data_generation.separate_fourier_modes
     score_model = S2ScoreNetwork().to(device)
+    score_model = DDP(score_model, device_ids=[local_rank], find_unused_parameters=True)
     quadrature_n = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
     points = fibonacci_sphere_points(quadrature_n)
     points = torch.from_numpy(points).float().to(device)  # [n_points, 3]
@@ -76,6 +84,8 @@ def train():
             from src.networks.dpf.conditional_separated_moment_encoder import CryoMomentsConditionalEncoder
             zarr_path = settings.data_generation.zarr.separated_modes_data_save_path
             cond_encoder = CryoMomentsConditionalEncoder().to(device)
+            dataloader = create_subspace_moments_dataloader(zarr_path, batch_size=batch_size,
+                                                             shuffle=True, debug=True, mode='train', device=device)
             print("[INFO] Using conditional SEPARATED moment encoder for training.")
         else:
             from src.data.emdb_vmf_subspace_moments_dataloader import create_subspace_moments_dataloader
@@ -83,7 +93,7 @@ def train():
             zarr_path = settings.data_generation.zarr.full_data_save_path
             z = zarr.open(zarr_path, mode='r')
             num_examples = z['distribution_evaluations'].shape[0]
-            dataloader = create_subspace_moments_dataloader(zarr_path, batch_size=1, shuffle=True)
+            dataloader = create_subspace_moments_dataloader(zarr_path, batch_size=1, shuffle=True, device=device)
             sample_batch = next(iter(dataloader))
             D = sample_batch['eigen_images'].shape[1]  # [B, D, N]
             cond_encoder = CryoMomentsConditionalEncoder(
@@ -93,8 +103,19 @@ def train():
                 D=D
             ).to(device)
             print("[INFO] Using conditional FULL moment encoder for training.")
+        cond_encoder = DDP(cond_encoder, device_ids=[local_rank], find_unused_parameters=True)
 
     # Load model parameters
+    def adjust_checkpoint_keys(ckpt_state, model_state):
+        # If model is wrapped with DDP, keys have 'module.' prefix
+        # If checkpoint keys don't have 'module.', add it
+        if all(k.startswith('module.') for k in model_state.keys()) and not all(k.startswith('module.') for k in ckpt_state.keys()):
+            ckpt_state = {'module.' + k if not k.startswith('module.') else k: v for k, v in ckpt_state.items()}
+        # If checkpoint keys have 'module.' but model does not, remove it
+        elif not all(k.startswith('module.') for k in model_state.keys()) and all(k.startswith('module.') for k in ckpt_state.keys()):
+            ckpt_state = {k.replace('module.', '', 1): v for k, v in ckpt_state.items()}
+        return ckpt_state
+
     ckpt_path = settings.model.checkpoint.load_path
     if ckpt_path:
         ckpt_path = os.path.expanduser(ckpt_path)
@@ -102,6 +123,7 @@ def train():
             checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
             ckpt_state = checkpoint['model_state_dict']
             score_model_state = score_model.state_dict()
+            ckpt_state = adjust_checkpoint_keys(ckpt_state, score_model_state)
             # keep only keys that exist in current model AND have the same shape
             score_model_filtered_state = {}
             for k, v in ckpt_state.items():
@@ -113,10 +135,12 @@ def train():
                         f"model={tuple(score_model_state.get(k, torch.empty(0)).shape)}")
             score_model_state.update(score_model_filtered_state)
             score_model.load_state_dict(score_model_state, strict=False)
+
             if use_conditional and 'cond_encoder_state_dict' in checkpoint:
                 cond_model_filtered_state = {}
                 cond_ckpt_state = checkpoint['cond_encoder_state_dict']
                 cond_model_state = cond_encoder.state_dict()
+                cond_ckpt_state = adjust_checkpoint_keys(cond_ckpt_state, cond_model_state)
                 for k, v in cond_ckpt_state.items():
                     if k in cond_model_state and v.shape == cond_model_state[k].shape:
                         cond_model_filtered_state[k] = v
@@ -130,9 +154,9 @@ def train():
                 # Freeze all model weights only for conditional training
                 for param in score_model.parameters():
                     param.requires_grad = False
-                for param in score_model.perceiver.cond_cross_attn_layers.parameters():
+                for param in score_model.module.perceiver.cond_cross_attn_layers.parameters():
                     param.requires_grad = True
-                for param in score_model.perceiver.cond_scales.parameters():
+                for param in score_model.module.perceiver.cond_scales.parameters():
                     param.requires_grad = True
                 optim_params = (
                     [p for p in score_model.parameters() if p.requires_grad] +
@@ -142,9 +166,11 @@ def train():
                 optim_params = [p for p in score_model.parameters() if p.requires_grad]
             optimizer = torch.optim.Adam(optim_params, lr=settings.training.learning_rate)
             # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"Loaded model parameters from {ckpt_path} (strict=False)")
+            if local_rank == 0:
+                print(f"Loaded model parameters from {ckpt_path} (strict=False)")
         else:
-            print(f"Model parameters file not found at {ckpt_path}")
+            if local_rank == 0:
+                print(f"Model parameters file not found at {ckpt_path}")
 
     def batch_provider(batch_size=batch_size):
         if not use_conditional:
@@ -158,8 +184,6 @@ def train():
                 }
                 yield batch
         else:
-            dataloader = create_subspace_moments_dataloader(zarr_path, batch_size=batch_size,
-                                                             shuffle=True, debug=True, mode='train')
             for batch in dataloader:
                 # Remap keys to match unconditional convention
                 mapped_batch = {
@@ -188,17 +212,20 @@ def train():
     def train_on_batch(batch, model, cond_encoder=None, device=None, points=None, optimizer=None):
         if batch is None:
             return None, None, None
-        batch_func = batch['func_data']
-        batch_func = batch_func / (batch_func.std(dim=1, keepdim=True))
-        current_batch_size = batch_func.shape[0]
-        t = torch.rand(current_batch_size, device=batch_func.device)
+        batch_func_base = batch['func_data']
+        batch_func_base = batch_func_base / (batch_func_base.std(dim=1, keepdim=True))
+        current_batch_size = batch_func_base.shape[0]
+        t = torch.rand(current_batch_size, device=batch_func_base.device)
         if use_conditional:
             volume_id = batch["volume_id"][0]
             R_vol_np = emdb_volumes_rotations[volume_id]["rotation"].astype(np.float32)
             R_inv = R_vol_np.T
-            batch_func_old = batch_func.clone()
+            mus = batch['mu']
+            kappas = batch['kappa']
+            weights = batch['weights']
+            # batch_func_old = batch_func.clone()
             batch_func = rotate_s2_function_interpolated(
-                points, batch_func, R_inv
+                points, batch_func_base, R_inv, mus, kappas, weights
             )
         x_t = q_sample(batch_func, t)
         context_encoding = build_network_input(
@@ -236,6 +263,7 @@ def train():
 
         # Rotate predicted score on S^2 using the per-volume rotation (conditional case)
         if use_conditional:
+            """
             candidate_targets = []
             candidate_losses = []
 
@@ -244,13 +272,17 @@ def train():
                 # (R * S)^{-1} = S * R^{-1} for diagonal S with ±1
                 R_inv_variant = S @ R_inv
                 rotated_true_score = rotate_s2_function_interpolated(
-                    points, true_score.detach(), R_inv_variant
+                    points, true_score.detach(), R_inv_variant, mus, kappas, weights
                 )
                 candidate_targets.append(rotated_true_score)
                 candidate_losses.append(dpf_score_matching_loss(pred_score, rotated_true_score))
             candidate_losses = torch.stack(candidate_losses)  # shape [4]
             loss, best_idx = torch.min(candidate_losses, dim=0)
             final_true_score = candidate_targets[best_idx.item()]
+            """
+            final_true_score = true_score
+            if not CURRICULUM_SINGLE_EXAMPLE:
+                loss = dpf_score_matching_loss(pred_score, final_true_score)
         else:
             final_true_score = true_score
             loss = dpf_score_matching_loss(pred_score, final_true_score)
@@ -259,38 +291,77 @@ def train():
             settings.data_generation.emdb.download_folder + "/" + batch['volume_id'][0] + ".map.gz",
             downsample_size=settings.data_generation.downsample_size,
         )
+
         """
         from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution
         from src.core.volume_distribution_model import VolumeDistributionModel
-        so3_rotations, so3_weights = create_in_plane_invariant_distribution(points.cpu().numpy(), batch_func_old[0].cpu().numpy(), 
-                                                                        num_in_plane_rotations=128)
+        so3_rotations, so3_weights = create_in_plane_invariant_distribution(
+            points.cpu().numpy(), batch_func_base[0].cpu().numpy(), 
+            num_in_plane_rotations=128)
+        
         V1 =  VolumeDistributionModel(
             aspire_volume, rotations=so3_rotations, distribution=so3_weights, in_plane_invariant_distribution=False)
         m11 = V1.first_analytical_moment()
         m21 = V1.second_analytical_moment(batch_size=50, show_progress=True)
-        so3_rotations, so3_weights = create_in_plane_invariant_distribution(points.cpu().numpy(), batch_func[0].cpu().numpy(), 
-                                                                        num_in_plane_rotations=128)
+        so3_rotations, so3_weights = create_in_plane_invariant_distribution(
+            points.cpu().numpy(), batch_func[0].cpu().numpy(),
+            num_in_plane_rotations=128)
+        
         so3_rotations = np.matmul(R_inv.T[None, :, :], so3_rotations)
         v2 =  VolumeDistributionModel(
             aspire_volume, rotations=so3_rotations, distribution=so3_weights, in_plane_invariant_distribution=False)
         m12 = v2.first_analytical_moment()
         m22 = v2.second_analytical_moment(batch_size=50, show_progress=True)
-        print(np.linalg.norm(m11-m12), np.linalg.norm(m21-m22))
-        raise Exception("Debugging moment mismatch")
+        print(np.linalg.norm(m11-m12)/np.linalg.norm(m11), np.linalg.norm(m21-m22)/np.linalg.norm(m21))
+        print(np.linalg.norm(m11+m12)/np.linalg.norm(m11), np.linalg.norm(m21+m22)/np.linalg.norm(m21))
+        raise Exception("Debugging moment consistency.")
         """
+
         pred_distribution = ((1 - scaling_t) * pred_score + x_t)/torch.sqrt(scaling_t)
-        loss += partial_moment_loss(
-            volume=aspire_volume,
-            back_rotation=R_inv.T,
-            pred_distribution=pred_distribution,
-            true_distribution=batch_func,
-            points=points,
-        )
+        if CURRICULUM_SINGLE_EXAMPLE:
+            nonlocal cached_first_moment, cached_second_moment
+            if cached_first_moment is None or cached_second_moment is None:
+                print("[INFO] Computing and caching first and second moment components for curriculum training...")
+                moment_loss, cached_first_moment, cached_second_moment = partial_moment_loss(
+                    volume=aspire_volume,
+                    back_rotation=R_inv.T,
+                    pred_distribution=pred_distribution,
+                    true_distribution=batch_func,
+                    points=points,
+                    single_volume_training=True,
+                    # batch_func_base=batch_func_base,
+                    # aspire_volume=aspire_volume
+                )
+                loss += moment_loss
+                print("[INFO] Cached first moment shape:", cached_first_moment.shape)
+                print("[INFO] Cached second moment shape:", cached_second_moment.shape)
+            else:
+                loss += partial_moment_loss(
+                    volume=aspire_volume,
+                    back_rotation=R_inv.T,
+                    pred_distribution=pred_distribution,
+                    true_distribution=batch_func,
+                    points=points,
+                    single_volume_training=True,
+                    cached_first_moment=cached_first_moment,
+                    cached_second_moment=cached_second_moment
+                )
+        else:
+            loss += partial_moment_loss(
+                volume=aspire_volume,
+                back_rotation=R_inv.T,
+                pred_distribution=pred_distribution,
+                true_distribution=batch_func,
+                points=points,
+            )
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         return loss.item(), pred_score, final_true_score
     def debug_and_save(avg_loss, pred_score, true_score, model, optimizer,cond_encoder=None, epoch=None, batch_index=None, avg_train_wait_count=None):
+        if local_rank != 0:
+            return  # Only let rank 0 print and save
         if not use_conditional:
             print(f"Epoch {epoch+1}/{settings.training.num_epochs} | Loss: {avg_loss:.6f}")
         else:
@@ -351,48 +422,66 @@ def train():
         batch_losses = []
         progress_bar = tqdm(range(total_batches), desc="Training (conditional)",
                              total=total_batches, leave=False)
-
-        for batch_idx in progress_bar:
-            wait_count = 0
-            saved_on_current_batch = False
-
-            # Try to fetch a fresh batch; if not ready, reuse current_batch
-            while True:
-                try:
-                    next_batch = prefetch_queue.get(block=False)
-                    if next_batch is None:
-                        break  # End of data, exit batch loop
-                    break
-                except queue.Empty:
-                    # No new batch available, train again on current_batch
-                    loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
-                                                                    device, points, optimizer)
-                    if loss is None:
-                        current_batch = next_batch
-                        continue  # Skip if training failed
-                    running_loss += loss
-                    batch_losses.append(loss)
-                    num_batches += 1
-                    wait_count += 1
-                    if batch_idx % batch_log_interval == 0 and (not batch_idx == 0) and (not saved_on_current_batch):
-                        avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
-                        debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
-                        saved_on_current_batch = True
-            train_wait_counts.append(wait_count)
-            loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
+        if CURRICULUM_SINGLE_EXAMPLE:
+            # Get a single batch and train on it repeatedly
+            from itertools import count
+            single_batch = current_batch
+            batch_idx = 0
+            progress_bar = tqdm(count(), desc="Curriculum Training (conditional, infinite)", leave=False)
+            for _ in progress_bar:
+                loss, pred_score, true_score = train_on_batch(single_batch, score_model, cond_encoder,
                                                             device, points, optimizer)
-            if loss is None:
+                if loss is None:
+                    continue
+                running_loss += loss
+                batch_losses.append(loss)
+                num_batches += 1
+                batch_idx += 1
+                if batch_idx % batch_log_interval == 0 and (not batch_idx == 0):
+                    avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
+                    debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
+        else:
+            for batch_idx in progress_bar:
+                wait_count = 0
+                saved_on_current_batch = False
+
+                # Try to fetch a fresh batch; if not ready, reuse current_batch
+                while True:
+                    try:
+                        next_batch = prefetch_queue.get(block=False)
+                        if next_batch is None:
+                            break  # End of data, exit batch loop
+                        break
+                    except queue.Empty:
+                        # No new batch available, train again on current_batch
+                        loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
+                                                                        device, points, optimizer)
+                        if loss is None:
+                            current_batch = next_batch
+                            continue  # Skip if training failed
+                        running_loss += loss
+                        batch_losses.append(loss)
+                        num_batches += 1
+                        wait_count += 1
+                        if batch_idx % batch_log_interval == 0 and (not batch_idx == 0) and (not saved_on_current_batch):
+                            avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
+                            debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
+                            saved_on_current_batch = True
+                train_wait_counts.append(wait_count)
+                loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
+                                                                device, points, optimizer)
+                if loss is None:
+                    current_batch = next_batch
+                    continue  # Skip if training failed
+                running_loss += loss
+                batch_losses.append(loss)
+                num_batches += 1
                 current_batch = next_batch
-                continue  # Skip if training failed
-            running_loss += loss
-            batch_losses.append(loss)
-            num_batches += 1
-            current_batch = next_batch
-            if batch_idx % batch_log_interval == 0 and (not batch_idx == 0):
-                avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
-                debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
-        stop_event.set()
-        prefetch_thread.join()
+                if batch_idx % batch_log_interval == 0 and (not batch_idx == 0):
+                    avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
+                    debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
+            stop_event.set()
+            prefetch_thread.join()
     else:
         for epoch in range(settings.training.num_epochs):
             running_loss = 0.0
@@ -407,4 +496,6 @@ def train():
             debug_and_save(avg_loss, pred_score, true_score, score_model, optimizer, epoch=epoch)
 
 if __name__ == '__main__':
-    train()
+    import os
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    train(local_rank)

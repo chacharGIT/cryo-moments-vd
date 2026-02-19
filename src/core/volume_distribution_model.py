@@ -48,12 +48,14 @@ class VolumeDistributionModel:
     """
 
     def __init__(self, volume: Volume, rotations: Rotation, distribution: np.ndarray, 
-                 distribution_metadata=None, fourier_domain=False, in_plane_invariant_distribution=False):
+                 distribution_metadata=None, fourier_domain=False,
+                 in_plane_invariant_distribution=False, device=None):
         self.volume = volume
         self.rotations = rotations
         self.distribution = self.normalize_distribution(distribution)
         self.in_plane_invariant_distribution = in_plane_invariant_distribution
         self.fourier_domain = fourier_domain
+        self.device = device
         # Store general distribution metadata (must be a dict with a 'type' key)
         if distribution_metadata is not None:
             if not isinstance(distribution_metadata, dict):
@@ -193,7 +195,8 @@ class VolumeDistributionModel:
             return projections, rotations_to_project
     
     def first_analytical_moment(self, num_projections_per_s2_point=1,
-                                 n_theta=settings.data_generation.cartesian_to_polar_n_theta, dtype=torch.float64):
+                                 n_theta=settings.data_generation.cartesian_to_polar_n_theta,
+                                 dtype=torch.float64, return_torch=False):
         """
         Calculate the first analytical moment.
         For in-plane invariant distributions, averages the polar representation of projections over theta,
@@ -217,16 +220,19 @@ class VolumeDistributionModel:
             dtype = torch.complex128 if dtype == torch.float64 else torch.complex64
 
         if not self.in_plane_invariant_distribution:
-            if settings.device.use_cuda:
-                device = f"cuda:{settings.device.cuda_device}"
+            if self.device is None:
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
             else:
-                device = "cpu"
+                device = self.device
             projections = self.generate_projections(rotations_to_project=self.rotations)
             weights_t = torch.from_numpy(weights).to(device=device, dtype=dtype)
             projections_t = torch.from_numpy(projections).to(device=device, dtype=dtype)
             weighted_projections = projections_t * weights_t[:, None, None]
             first_moment = torch.sum(weighted_projections, dim=0)
-            return first_moment.cpu().numpy()
+            if return_torch:
+                return first_moment
+            else:
+                return first_moment.cpu().numpy()
         else:
             # Generate projections with multiple psi angles per S2 point
             projections = self.generate_projections(
@@ -255,9 +261,12 @@ class VolumeDistributionModel:
             # Build polar image: repeat weighted_radial for all theta
             polar_image = np.tile(weighted_radial[:, None], (1, n_theta))
             first_moment = polar_to_cartesian(polar_image, r_vals, n_theta, output_shape=(H, W))
-            return first_moment
+            if return_torch:
+                return torch.from_numpy(first_moment).to(dtype=dtype)
+            else:
+                return first_moment
 
-    def second_analytical_moment(self, batch_size=10, show_progress=False, dtype=torch.float64):
+    def second_analytical_moment(self, batch_size=10, show_progress=False, dtype=torch.float64, return_torch=False):
         """
         Calculate the second analytical moment in batches to avoid memory blowup.
 
@@ -267,8 +276,6 @@ class VolumeDistributionModel:
             Number of projections to process per batch.
         show_progress : bool
             Whether to show a progress bar.
-        device : str, optional
-            Device to use for computation ('cuda' or 'cpu'). If None, uses GPU if available.
         dtype : torch.dtype
             Data type for computation (e.g., torch.float32 or torch.float64).
 
@@ -279,10 +286,10 @@ class VolumeDistributionModel:
         """
         L = self.volume.resolution
         N = len(self.rotations)
-        if settings.device.use_cuda:
-            device = f"cuda:{settings.device.cuda_device}"
+        if self.device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
         else:
-            device = "cpu"
+            device = self.device
         if self.fourier_domain:
             dtype = torch.complex128 if dtype == torch.float64 else torch.complex64
         second_moment = torch.zeros((L, L, L, L), dtype=dtype, device=device)
@@ -305,9 +312,12 @@ class VolumeDistributionModel:
                 outer = torch.einsum('bij,bkl->bijkl', batch_projs, batch_projs)
             weighted_outer = batch_weights[:, None, None, None, None] * outer
             second_moment += torch.sum(weighted_outer, dim=0)
-        return second_moment.cpu().numpy()
+        if return_torch:
+            return second_moment
+        else:
+            return second_moment.cpu().numpy()
     
-    def third_analytical_moment_sketch(self, sketch_size, device=None, dtype=torch.float32):
+    def third_analytical_moment_sketch(self, sketch_size, dtype=torch.float32):
         """
         Calculate the third analytical moment using structured tensor sketching (see Eq. 46 in the referenced method).
         This method avoids memory blowup by sketching the unfolded third moment tensor using two Gaussian matrices.
@@ -332,8 +342,10 @@ class VolumeDistributionModel:
         d = L * L
         projections = self.volume.project(self.rotations).asnumpy().copy()  # (N, L, L)
         weights = self.distribution
-        if device is None:
+        if self.device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            device = self.device
         projections_t = torch.from_numpy(projections).to(device=device, dtype=dtype)
         weights_t = torch.from_numpy(weights).to(device=device, dtype=dtype)
         N = projections_t.shape[0]
