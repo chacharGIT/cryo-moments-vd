@@ -72,8 +72,8 @@ def dpf_score_matching_loss(
 
 def partial_moment_loss(
     pred_distribution, true_distribution, volume, back_rotation, points,
-     num_sampled_first=64, num_sampled_second=16, num_inplane_rotations=10,
-     lambda_1=0.2, lambda_2=1.2, single_volume_training=False, cached_first_moment=None,
+     num_sampled_first=200, num_sampled_second=50, num_inplane_rotations=20,
+     lambda_1=0.02, lambda_2=0.1, single_volume_training=False, cached_first_moment=None,
     cached_second_moment=None, batch_func_base=None, aspire_volume=None
 ):
     """

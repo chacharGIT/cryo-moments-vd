@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from functools import wraps
 
+from config.config import settings
+
 def exists(val):
     return val is not None
 
@@ -67,7 +69,7 @@ class FeedForward(nn.Module):
 class Attention(nn.Module):
     """
     Multi-head attention module for Perceiver-style architectures.
-    Args:
+    Parameters:
         query_dim (int): Dimension of query input.
         context_dim (int, optional): Dimension of context input. Defaults to query_dim.
         heads (int): Number of attention heads.
@@ -130,7 +132,7 @@ class PreNorm(nn.Module):
 class PerceiverIO(nn.Module):
     """
     PerceiverIO core model.
-    Args:
+    Parameters:
         depth (int): Number of Perceiver blocks.
         dim (int): Input embedding dimension.
         queries_dim (int): Query embedding dimension (output tokens).
@@ -195,14 +197,27 @@ class PerceiverIO(nn.Module):
                 ),
                 context_dim=latent_dim,
             )
-            for _ in range(depth+1)
-        ])
-        self.cond_scales = nn.ParameterList([
-            nn.Parameter(torch.tensor(1.0)) for _ in range(depth + 1)
+            for _ in range(2)
         ])
 
         # Xavier initialization for all Linear layers
         self.apply(xavier_init_linear)
+        
+        self.cond_scales = nn.ParameterList([
+            nn.Parameter(torch.tensor(-5.0)) for _ in range(2)
+        ])
+        self.t_enc_dim = settings.dpf.time_encoding_len
+        self.t_latent_embedding = nn.Linear(self.t_enc_dim, latent_dim)
+        self.gamma = nn.Linear(latent_dim, latent_dim)
+        self.beta = nn.Linear(latent_dim, latent_dim)
+        nn.init.zeros_(self.gamma.weight)
+        if self.gamma.bias is not None:
+            nn.init.zeros_(self.gamma.bias)
+
+        nn.init.zeros_(self.beta.weight)
+        if self.beta.bias is not None:
+            nn.init.zeros_(self.beta.bias)
+
 
     def forward(self, data, mask=None, queries=None, cond_feat=None):
         b = data.shape[0]
@@ -215,18 +230,27 @@ class PerceiverIO(nn.Module):
         if cond_feat is not None:
             if self.training and torch.rand(()) < self.p_drop_cond:
                 cond_feat = None
+            else:
+                t_enc = data[:, 0, :self.t_enc_dim]                 # [B, t_enc_dim]
+                t_enc = t_enc.to(dtype=cond_feat.dtype, device=cond_feat.device)
+                t_emb = self.t_latent_embedding(t_enc)             # [B, latent_dim]
+                gamma = self.gamma(t_emb).unsqueeze(1)             # [B, 1, latent_dim]
+                beta = self.beta(t_emb).unsqueeze(1)               # [B, 1, latent_dim]
+                cond_feat = cond_feat * (1.0 + gamma) + beta       # [B, Q, latent_dim]
         cross_attn, cross_ff = self.cross_attend_blocks
         if self.training and self.seq_dropout_prob > 0.:
             data, mask = dropout_seq(data, mask, self.seq_dropout_prob)
         x = cross_attn(x, context=data, mask=mask) + x
         if cond_feat is not None:
-                x = x + self.cond_scales[0] * self.cond_cross_attn_layers[0](x, context=cond_feat)
+                delta = self.cond_cross_attn_layers[0](x, context=cond_feat)
+                x = x + torch.sigmoid(self.cond_scales[0]) * delta
         x = cross_ff(x) + x
 
         for layer_idx, (self_attn, self_ff) in enumerate(self.layers):
             x = self_attn(x) + x
-            if cond_feat is not None:
-                x = x + self.cond_scales[layer_idx + 1] * self.cond_cross_attn_layers[layer_idx+1](x, context=cond_feat)
+            if layer_idx == len(self.layers) // 2 and cond_feat is not None:
+                delta = self.cond_cross_attn_layers[1](x, context=cond_feat)
+                x = x + torch.sigmoid(self.cond_scales[1]) * delta
             x = self_ff(x) + x
 
         if not exists(queries):

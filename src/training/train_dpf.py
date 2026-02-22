@@ -1,3 +1,5 @@
+import dis
+
 from matplotlib.pylab import f
 from pyparsing import C
 import torch
@@ -10,6 +12,7 @@ import os
 import zarr
 import threading
 import queue
+import signal
 
 from config.config import settings
 from src.data.emdb_downloader import load_aspire_volume
@@ -19,6 +22,59 @@ from src.networks.dpf.score_network import S2ScoreNetwork
 from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_schedule
 from src.networks.dpf.loss import dpf_score_matching_loss, partial_moment_loss
 from src.networks.dpf.torch_utils import rotate_s2_function_interpolated
+
+def handle_sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+
+def adjust_checkpoint_keys(ckpt_state, model_state):
+    """
+    Adjust checkpoint state dict keys to match model state dict keys,
+     handling 'module.' prefix from DDP wrapping.
+
+    Parameters:
+        ckpt_state: state dict from checkpoint (may have 'module.' prefix or not)
+        model_state: state dict from model (may have 'module.' prefix or not)
+    
+    Returns:
+        ckpt_state: adjusted checkpoint state dict with keys modified to match model_state keys
+    """
+    if all(k.startswith('module.') for k in model_state.keys()) and not all(k.startswith('module.') for k in ckpt_state.keys()):
+        ckpt_state = {'module.' + k if not k.startswith('module.') else k: v for k, v in ckpt_state.items()}
+    
+    # If checkpoint keys have 'module.' but model does not, remove it
+    elif not all(k.startswith('module.') for k in model_state.keys()) and all(k.startswith('module.') for k in ckpt_state.keys()):
+        ckpt_state = {k.replace('module.', '', 1): v for k, v in ckpt_state.items()}
+    return ckpt_state
+
+def load_filtered_state_dict_compat(model, ckpt_state, verbose=True):
+    """
+    Load checkpoint weights into model:
+      - fix 'module.' prefix mismatch
+      - keep only keys that exist AND match shape
+      - strict=False
+    
+    Parameters:
+        model: the PyTorch model to load weights into
+        ckpt_state: the state dict from the checkpoint (already adjusted for 'module.' prefix)
+        verbose: if True, print skipped keys due to shape mismatch or missing keys
+    """
+    model_state = model.state_dict()
+    ckpt_state = adjust_checkpoint_keys(ckpt_state, model_state)
+
+    filtered = {}
+    for k, v in ckpt_state.items():
+        if k in model_state and v.shape == model_state[k].shape:
+            filtered[k] = v
+        else:
+            if verbose:
+                print(f"[CKPT] skipping key due to shape mismatch or missing: {k} "
+                        f"ckpt={tuple(v.shape)} "
+                        f"model={tuple(model_state.get(k, torch.empty(0)).shape)}")
+
+    model_state.update(filtered)
+    model.load_state_dict(model_state, strict=False)
 
 def train(local_rank):
     CURRICULUM_SINGLE_EXAMPLE = False
@@ -106,58 +162,57 @@ def train(local_rank):
         cond_encoder = DDP(cond_encoder, device_ids=[local_rank], find_unused_parameters=True)
 
     # Load model parameters
-    def adjust_checkpoint_keys(ckpt_state, model_state):
-        # If model is wrapped with DDP, keys have 'module.' prefix
-        # If checkpoint keys don't have 'module.', add it
-        if all(k.startswith('module.') for k in model_state.keys()) and not all(k.startswith('module.') for k in ckpt_state.keys()):
-            ckpt_state = {'module.' + k if not k.startswith('module.') else k: v for k, v in ckpt_state.items()}
-        # If checkpoint keys have 'module.' but model does not, remove it
-        elif not all(k.startswith('module.') for k in model_state.keys()) and all(k.startswith('module.') for k in ckpt_state.keys()):
-            ckpt_state = {k.replace('module.', '', 1): v for k, v in ckpt_state.items()}
-        return ckpt_state
-
     ckpt_path = settings.model.checkpoint.load_path
     if ckpt_path:
         ckpt_path = os.path.expanduser(ckpt_path)
         if os.path.isfile(ckpt_path):
-            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-            ckpt_state = checkpoint['model_state_dict']
-            score_model_state = score_model.state_dict()
-            ckpt_state = adjust_checkpoint_keys(ckpt_state, score_model_state)
-            # keep only keys that exist in current model AND have the same shape
-            score_model_filtered_state = {}
-            for k, v in ckpt_state.items():
-                if k in score_model_state and v.shape == score_model_state[k].shape:
-                    score_model_filtered_state[k] = v
-                else:
-                    print(f"[CKPT] skipping key due to shape mismatch or missing: {k} "
-                        f"ckpt={tuple(v.shape)} "
-                        f"model={tuple(score_model_state.get(k, torch.empty(0)).shape)}")
-            score_model_state.update(score_model_filtered_state)
-            score_model.load_state_dict(score_model_state, strict=False)
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+            load_filtered_state_dict_compat(
+                score_model,
+                checkpoint['model_state_dict'],
+                verbose=False
+            )
+            if use_conditional:
+                if 'cond_encoder_state_dict' in checkpoint:
+                    load_filtered_state_dict_compat(
+                        cond_encoder,
+                        checkpoint['cond_encoder_state_dict'],
+                        verbose=False
+                    )
+                """
+                # Reinitialize conditional modules in the score model
+                def _reset(m):
+                    if hasattr(m, "reset_parameters"):
+                        m.reset_parameters()
+                smp = score_model.module.perceiver
+                smp.cond_cross_attn_layers.apply(_reset)
+                smp.t_latent_embedding.apply(_reset)
 
-            if use_conditional and 'cond_encoder_state_dict' in checkpoint:
-                cond_model_filtered_state = {}
-                cond_ckpt_state = checkpoint['cond_encoder_state_dict']
-                cond_model_state = cond_encoder.state_dict()
-                cond_ckpt_state = adjust_checkpoint_keys(cond_ckpt_state, cond_model_state)
-                for k, v in cond_ckpt_state.items():
-                    if k in cond_model_state and v.shape == cond_model_state[k].shape:
-                        cond_model_filtered_state[k] = v
-                    else:
-                        print(f"[CKPT] skipping cond_encoder key due to shape mismatch or missing: {k} "
-                            f"ckpt={tuple(v.shape)} "
-                            f"model={tuple(cond_model_state.get(k, torch.empty(0)).shape)}")
-                cond_model_state.update(cond_model_filtered_state)
-                cond_encoder.load_state_dict(cond_model_state, strict=False)
+                smp.gamma.apply(_reset)
+                torch.nn.init.zeros_(smp.gamma.weight)
+                if smp.gamma.bias is not None:
+                    torch.nn.init.zeros_(smp.gamma.bias)
 
-                # Freeze all model weights only for conditional training
+                smp.beta.apply(_reset)
+                torch.nn.init.zeros_(smp.beta.weight)
+                if smp.beta.bias is not None:
+                    torch.nn.init.zeros_(smp.beta.bias)
+                
+                with torch.no_grad():
+                    for p in smp.cond_scales:
+                        p.fill_(-5.0)
+                print("[INFO] Reinitialized conditional modules in the score model after loading checkpoint.")
+                """
+                # Freeze all model weights for conditional training except for the conditional modules
                 for param in score_model.parameters():
                     param.requires_grad = False
-                for param in score_model.module.perceiver.cond_cross_attn_layers.parameters():
-                    param.requires_grad = True
-                for param in score_model.module.perceiver.cond_scales.parameters():
-                    param.requires_grad = True
+
+                smp = score_model.module.perceiver
+                conditional_modules = [smp.cond_cross_attn_layers, smp.cond_scales,
+                                       smp.t_latent_embedding, smp.gamma, smp.beta]
+                for module in conditional_modules:
+                    for param in module.parameters():
+                        param.requires_grad = True
                 optim_params = (
                     [p for p in score_model.parameters() if p.requires_grad] +
                     list(cond_encoder.parameters())
@@ -441,47 +496,56 @@ def train(local_rank):
                     avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
                     debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
         else:
-            for batch_idx in progress_bar:
-                wait_count = 0
-                saved_on_current_batch = False
+            try:
+                for batch_idx in progress_bar:
+                    wait_count = 0
+                    saved_on_current_batch = False
 
-                # Try to fetch a fresh batch; if not ready, reuse current_batch
-                while True:
-                    try:
-                        next_batch = prefetch_queue.get(block=False)
-                        if next_batch is None:
-                            break  # End of data, exit batch loop
-                        break
-                    except queue.Empty:
-                        # No new batch available, train again on current_batch
-                        loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
-                                                                        device, points, optimizer)
-                        if loss is None:
-                            current_batch = next_batch
-                            continue  # Skip if training failed
-                        running_loss += loss
-                        batch_losses.append(loss)
-                        num_batches += 1
-                        wait_count += 1
-                        if batch_idx % batch_log_interval == 0 and (not batch_idx == 0) and (not saved_on_current_batch):
-                            avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
-                            debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
-                            saved_on_current_batch = True
-                train_wait_counts.append(wait_count)
-                loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
-                                                                device, points, optimizer)
-                if loss is None:
+                    # Try to fetch a fresh batch; if not ready, reuse current_batch
+                    while True:
+                        try:
+                            next_batch = prefetch_queue.get(block=False)
+                            if next_batch is None:
+                                break  # End of data, exit batch loop
+                            break
+                        except queue.Empty:
+                            # No new batch available, train again on current_batch
+                            loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
+                                                                            device, points, optimizer)
+                            if loss is None:
+                                current_batch = next_batch
+                                continue  # Skip if training failed
+                            running_loss += loss
+                            batch_losses.append(loss)
+                            num_batches += 1
+                            wait_count += 1
+                            if batch_idx % batch_log_interval == 0 and (not batch_idx == 0) and (not saved_on_current_batch):
+                                avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
+                                debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
+                                saved_on_current_batch = True
+                    train_wait_counts.append(wait_count)
+                    loss, pred_score, true_score = train_on_batch(current_batch, score_model, cond_encoder,
+                                                                    device, points, optimizer)
+                    if loss is None:
+                        current_batch = next_batch
+                        continue  # Skip if training failed
+                    running_loss += loss
+                    batch_losses.append(loss)
+                    num_batches += 1
                     current_batch = next_batch
-                    continue  # Skip if training failed
-                running_loss += loss
-                batch_losses.append(loss)
-                num_batches += 1
-                current_batch = next_batch
-                if batch_idx % batch_log_interval == 0 and (not batch_idx == 0):
-                    avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
-                    debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
-            stop_event.set()
-            prefetch_thread.join()
+                    if batch_idx % batch_log_interval == 0 and (not batch_idx == 0):
+                        avg_interval_loss = sum(batch_losses[-batch_log_interval:]) / batch_log_interval
+                        debug_and_save(avg_interval_loss, pred_score, true_score, score_model, optimizer, cond_encoder=cond_encoder, batch_index=batch_idx)
+                stop_event.set()
+                prefetch_thread.join()
+            except KeyboardInterrupt:
+                print("Gracefully stopping training loop...")
+            finally:
+                if dist.is_initialized():
+                    try:
+                        dist.destroy_process_group()
+                    except:
+                        pass
     else:
         for epoch in range(settings.training.num_epochs):
             running_loss = 0.0
@@ -497,5 +561,18 @@ def train(local_rank):
 
 if __name__ == '__main__':
     import os
+    import sys
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    train(local_rank)
+    
+    try:
+        train(local_rank)
+    except KeyboardInterrupt:
+        print(f"[Rank {local_rank}] Caught Ctrl+C. Cleaning up...")
+    finally:
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except:
+                pass
+        torch.cuda.empty_cache()
+        sys.exit(0)

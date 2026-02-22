@@ -11,6 +11,7 @@ import zarr
 import numpy as np
 import os
 import random
+import time
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 import torch.distributed as dist
 
@@ -250,6 +251,7 @@ class ChunkShuffleIterableDataset(IterableDataset):
         self.batch_size = batch_size
 
     def __iter__(self):
+        _err_print_every_s = 10.0
         rank = 0
         world_size = 1
         if dist.is_available() and dist.is_initialized():
@@ -274,6 +276,7 @@ class ChunkShuffleIterableDataset(IterableDataset):
         chunk_ptr_per_vol = {vid: 0 for vid in volume_ids}
         offset_in_chunk_per_vol = {vid: 0 for vid in volume_ids}
 
+        _last_err_print_t = 0.0
         while True:
             # Pick a random volume for this batch
             vid = random.choice(volume_ids)
@@ -323,7 +326,10 @@ class ChunkShuffleIterableDataset(IterableDataset):
                 if self.device is not None:
                     batch = to_device(batch, self.device)
             except Exception as e:
-                print(f"Error fetching batch for volume {vid}: {type(e).__name__}: {e}")
+                now = time.monotonic()
+                if now - _last_err_print_t >= _err_print_every_s:
+                    print(f"Error fetching batch for volume {vid}: {type(e).__name__}: {e}")
+                    _last_err_print_t = now
                 continue
             yield batch
 

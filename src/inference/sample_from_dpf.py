@@ -3,14 +3,16 @@ import torch
 import numpy as np
 import zarr
 import random
+from packages.dpm_solver.dpm_solver_pytorch import model_wrapper, DPM_Solver
+
 from config.config import settings
 from src.networks.dpf.score_network import S2ScoreNetwork
 from src.networks.dpf.sample_generation import build_network_input, generate_vmf_mixture_on_s2
 from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_schedule, beta_schedule
 from src.networks.dpf.conditional_moment_encoder import CryoMomentsConditionalEncoder
+from src.networks.dpf.torch_utils import rotate_s2_function_interpolated
+from src.training.train_dpf import load_filtered_state_dict_compat
 
-# DPM-Solver++ integration
-from packages.dpm_solver.dpm_solver_pytorch import model_wrapper, DPM_Solver
 
 def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_step_size=1e-2,
                                 cond_feat=None, use_guidance=False):
@@ -43,7 +45,7 @@ def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_s
     solver_t_end = 1e-3
     solver_t_vals = torch.linspace(solver_t_start, solver_t_end, solver_steps+1, device=device)
 
-    def score_model_wrapper(x, t):
+    def score_model_wrapper(x, t, cond_feat=cond_feat):
         # Cast x and t to float32 for model, keep float64 for integration
         x_model = x.to(torch.float32)
         t_model = t.to(torch.float32)
@@ -52,8 +54,11 @@ def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_s
             time_enc_len=settings.dpf.time_encoding_len,
             sph_enc_len=settings.dpf.pos_encoding_max_harmonic_degree
         )
-        context_encoding = context_encoding.to(model.parameters().__next__().dtype)
+        model_dtype = next(model.parameters()).dtype
+        context_encoding = context_encoding.to(dtype=model_dtype)
         query_encoding = context_encoding
+        cond_feat = None if cond_feat is None else cond_feat.to(dtype=model_dtype)
+
         with torch.no_grad():
             if cond_feat is not None:
                 cond_score = model(context=context_encoding, queries=query_encoding, cond_feat=cond_feat).squeeze(-1)
@@ -100,6 +105,15 @@ def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_s
     tN = solver_t_vals[-1]
     x_curr = dpm_solver_ode.sample(x_curr, steps=solver_steps, t_start=t0.item(), t_end=tN.item(), order=min(3, solver_steps), skip_type='time_uniform', method='multistep')
     return x_curr
+
+# Checkpoint key adjustment (training uses DDP, inference does not)
+def _adjust_checkpoint_keys(ckpt_state, model_state):
+    if all(k.startswith('module.') for k in model_state.keys()) and not all(k.startswith('module.') for k in ckpt_state.keys()):
+        ckpt_state = {'module.' + k if not k.startswith('module.') else k: v for k, v in ckpt_state.items()}
+    elif not all(k.startswith('module.') for k in model_state.keys()) and all(k.startswith('module.') for k in ckpt_state.keys()):
+        ckpt_state = {k.replace('module.', '', 1): v for k, v in ckpt_state.items()}
+    return ckpt_state
+
 
 def plot_s2_comparison(points, plot_dict, t=None, save_path=None):
     """
@@ -152,50 +166,84 @@ def plot_s2_comparison(points, plot_dict, t=None, save_path=None):
     plt.savefig(save_path)
 
 if __name__ == "__main__":
-    # Use CUDA if available and allowed by config
-    device = torch.device(f"cuda:{settings.device.cuda_device}" if settings.device.use_cuda and torch.cuda.is_available() else "cpu")
-    model = S2ScoreNetwork().to(device)
-
-    checkpoint = torch.load("./outputs/model_parameter_files/dpf_cond_test_2_epoch_19_batch_1600.pth", map_location=device)
     # Selection: plot single timestep or run full diffusion inference
-    mode = "diffusion" # "single" or "diffusion"
-    t_value = 0.88 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
-    use_conditional = True
+    mode = "single" # "single" or "diffusion"
+    t_value = 0.5 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
     plot_conditional_vs_unconditional_comparison = True
     use_guidance = True
     use_zarr_example = False
+    device = torch.device(f"cuda:{settings.device.cuda_device}" if settings.device.use_cuda and torch.cuda.is_available() else "cpu")
+    use_conditional = settings.dpf.conditional_moment_encoder.use_encoder
+    separate_fourier_modes = settings.data_generation.separate_fourier_modes
+    batch_size = 1
 
-    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-    model = model.to(torch.float64)
-    model.eval()
+    score_model = S2ScoreNetwork().to(device)
+    if use_conditional:
+        emdb_volumes_rotations = np.load(
+                settings.data_generation.emdb.volume_rotations_path,
+                allow_pickle=True
+            ).item()
+        if separate_fourier_modes:
+            from src.data.emdb_vmf_separated_subspace_moments_dataloader import create_subspace_moments_dataloader
+            from src.networks.dpf.conditional_separated_moment_encoder import CryoMomentsConditionalEncoder
+            zarr_path = settings.data_generation.zarr.separated_modes_data_save_path
+            cond_encoder = CryoMomentsConditionalEncoder().to(device)
+            dataloader = create_subspace_moments_dataloader(zarr_path, batch_size=batch_size,
+                                                                shuffle=True, debug=True, mode='train', device=device)        
+    checkpoint = torch.load("./outputs/model_parameter_files/dpf_cond_2_batch_11100.pth", map_location=device, weights_only=False)
+    load_filtered_state_dict_compat(score_model, checkpoint["model_state_dict"], verbose=True)
+    score_model = score_model.to(torch.float32)
+    score_model.eval()
+    if use_conditional and ("cond_encoder_state_dict" in checkpoint):
+        load_filtered_state_dict_compat(cond_encoder, checkpoint["cond_encoder_state_dict"], verbose=True)
+        cond_encoder = cond_encoder
+        cond_encoder.eval()
 
     # Prepare S2 points
     n_points = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
     from src.utils.distribution_generation_functions import fibonacci_sphere_points
     points = fibonacci_sphere_points(n_points)
-    points = torch.from_numpy(points).float().unsqueeze(0).to(device)
+    points = torch.from_numpy(points).float().to(device)
+    #points = torch.from_numpy(points).float().unsqueeze(0).to(device)
 
-    # Common function generation code
-    batch = 1
-    n_points = points.shape[1]
     if use_conditional:
-        zarr_path = "/data/shachar/zarr_files/emdb_vmf_top_eigen.zarr"
-        z = zarr.open(zarr_path, mode='r')
-        num_examples = z['distribution_evaluations'].shape[0]
-        idx = random.randint(0, num_examples - 1)
-        func_data = torch.from_numpy(z['distribution_evaluations'][idx:idx+1]).float().to(device)
-        eigen_images = torch.from_numpy(z['eigen_images'][idx:idx+1]).float().to(device)
-        eigen_values = torch.from_numpy(z['eigen_values'][idx:idx+1]).float().to(device)
-        first_moments = torch.from_numpy(z['first_moments'][idx:idx+1]).float().to(device)
-        # Instantiate conditional encoder
-        D = eigen_images.shape[1]
-        cond_encoder = CryoMomentsConditionalEncoder(
-            output_dim=settings.dpf.perceiver.latent_dim,
-            num_queries_eig=settings.dpf.conditional_moment_encoder.num_queries_eig,
-            unet_out_channels=settings.dpf.conditional_moment_encoder.first_moment_unet_out_channels,
-            D=D
-        ).to(device)
-        cond_feat = cond_encoder(eigen_images.transpose(1, 2), first_moments, eigen_values)
+        if separate_fourier_modes:
+            batch = next(iter(dataloader))
+            batch_func_base = batch['distribution_evaluations'].float().to(device)
+            batch_func_base = batch_func_base / (batch_func_base.std(dim=1, keepdim=True) + 1e-10)
+            volume_id = batch["volume_id"][0]
+            R_vol_np = emdb_volumes_rotations[volume_id]["rotation"].astype(np.float32)
+            R_inv = R_vol_np.T
+            mus = batch['s2_distribution_means']
+            kappas = batch['s2_distribution_kappas']
+            weights = batch['s2_distribution_weights']
+            func_data = rotate_s2_function_interpolated(
+                points, batch_func_base, R_inv, mus, kappas, weights
+            )
+            cond_feat = cond_encoder(
+                batch['eigen_radial_by_m'],
+                batch['eigen_values_by_m'],
+                batch['first_moments_radial'],
+                batch['mask_by_m']
+            )
+        else:
+            zarr_path = "/data/shachar/zarr_files/emdb_vmf_top_eigen.zarr"
+            z = zarr.open(zarr_path, mode='r')
+            num_examples = z['distribution_evaluations'].shape[0]
+            idx = random.randint(0, num_examples - 1)
+            func_data = torch.from_numpy(z['distribution_evaluations'][idx:idx+1]).float().to(device)
+            eigen_images = torch.from_numpy(z['eigen_images'][idx:idx+1]).float().to(device)
+            eigen_values = torch.from_numpy(z['eigen_values'][idx:idx+1]).float().to(device)
+            first_moments = torch.from_numpy(z['first_moments'][idx:idx+1]).float().to(device)
+            # Instantiate conditional encoder
+            D = eigen_images.shape[1]
+            cond_encoder = CryoMomentsConditionalEncoder(
+                output_dim=settings.dpf.perceiver.latent_dim,
+                num_queries_eig=settings.dpf.conditional_moment_encoder.num_queries_eig,
+                unet_out_channels=settings.dpf.conditional_moment_encoder.first_moment_unet_out_channels,
+                D=D
+            ).to(device)
+            cond_feat = cond_encoder(eigen_images.transpose(1, 2), first_moments, eigen_values)
     else:
         if use_zarr_example:
             import os
@@ -205,30 +253,34 @@ if __name__ == "__main__":
             idx = random.randint(0, num_examples - 1)
             func_data = torch.from_numpy(z['func_data'][idx:idx+1]).float().to(device)
         else:
-            _, func_data, _ = generate_vmf_mixture_on_s2(batch_size=batch)
+            _, func_data, _ = generate_vmf_mixture_on_s2(batch_size=batch_size)
             func_data = torch.from_numpy(func_data).float().to(device)
         cond_feat = None
     func_data = func_data / (func_data.std(dim=1, keepdim=True))
 
     if mode == 'single':
-        t = torch.full((batch,), t_value, device=device)
+        t = torch.full((batch_size,), t_value, device=device)
         x_t = q_sample(func_data, t)
         context_encoding = build_network_input(
             points, t, x_t,
             time_enc_len=settings.dpf.time_encoding_len,
             sph_enc_len=settings.dpf.pos_encoding_max_harmonic_degree
         )
-        context_encoding = context_encoding.to(torch.float64)
-        query_encoding = context_encoding.to(torch.float64)
+        model_dtype = next(score_model.parameters()).dtype
+        context_encoding = context_encoding.to(dtype=model_dtype)
+        query_encoding = context_encoding
+        if cond_feat is not None:
+            cond_feat = cond_feat.to(dtype=model_dtype)
+
         with torch.no_grad():
             # cond_feat is None if not using conditional model
-            pred_score = model(context=context_encoding, queries=query_encoding, cond_feat=cond_feat)
+            pred_score = score_model(context=context_encoding, queries=query_encoding, cond_feat=cond_feat)
         scaling_t = cosine_signal_scaling_schedule(t).reshape(-1, *([1] * (x_t.dim() - 1)))
         x0_est = (x_t + pred_score.squeeze(-1) * (1 - scaling_t)) / torch.sqrt(scaling_t)
         true_score = -(x_t - torch.sqrt(scaling_t) * func_data) / (1 - scaling_t)
         if plot_conditional_vs_unconditional_comparison:
             with torch.no_grad():
-                    pred_score_uncond = model(context=context_encoding, queries=query_encoding, cond_feat=None)
+                    pred_score_uncond = score_model(context=context_encoding, queries=query_encoding, cond_feat=None)
             x0_est_uncond = (x_t + pred_score_uncond.squeeze(-1) * (1 - scaling_t)) / torch.sqrt(scaling_t)
             print("Conditional vs True difference (MSE):", torch.mean((func_data - x0_est) ** 2).item())
             print("Unconditional vs True difference (MSE):", torch.mean((func_data - x0_est_uncond) ** 2).item())
@@ -247,14 +299,14 @@ if __name__ == "__main__":
         
             
     elif mode == 'diffusion':
-        t = torch.full((batch,), t_value, device=device)
+        t = torch.full((batch_size,), t_value, device=device)
         initial_image = q_sample(func_data, t)
 
         # cond_feat is None if not using conditional model
-        x0_est = diffusion_inference_process(model, points, initial_image, t_start=t_value, cond_feat=cond_feat,
+        x0_est = diffusion_inference_process(score_model, points, initial_image, t_start=t_value, cond_feat=cond_feat,
                                               use_guidance=use_guidance)
         if plot_conditional_vs_unconditional_comparison:
-            x0_est_uncond = diffusion_inference_process(model, points, initial_image, t_start=t_value, cond_feat=None,
+            x0_est_uncond = diffusion_inference_process(score_model, points, initial_image, t_start=t_value, cond_feat=None,
                                                          use_guidance=use_guidance)
             plot_s2_comparison(points, {
                 "x_0 (clean)": func_data,

@@ -149,6 +149,7 @@ class CryoMomentsConditionalEncoder(nn.Module):
         self.num_cond_queries = settings.dpf.conditional_separated_moment_encoder.num_cond_queries
         self.reduce_R = nn.Linear(self.R, self.latent_dim)
         self.reduce_TD = nn.Linear(self.T * self.D, self.num_cond_queries)
+        self.cond_feat_norm = nn.LayerNorm(self.latent_dim)
         
     def forward(self, second_moment_radial_subspace, second_moment_eigen_values, first_moment_radial, mask_dict):
         """
@@ -208,5 +209,6 @@ class CryoMomentsConditionalEncoder(nn.Module):
         x = x.permute(0, 2, 1)
         x = self.reduce_TD(x) # [B, latent_dim, num_cond_queries]
         cond_feat = x.permute(0, 2, 1)
+        cond_feat = self.cond_feat_norm(cond_feat) # LayerNorm over latent_dim
         return cond_feat
     
