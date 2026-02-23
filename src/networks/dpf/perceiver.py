@@ -1,3 +1,4 @@
+from numpy import linalg
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -204,7 +205,7 @@ class PerceiverIO(nn.Module):
         self.apply(xavier_init_linear)
         
         self.cond_scales = nn.ParameterList([
-            nn.Parameter(torch.tensor(-5.0)) for _ in range(2)
+            nn.Parameter(torch.tensor(-1.0)) for _ in range(2)
         ])
         self.t_enc_dim = settings.dpf.time_encoding_len
         self.t_latent_embedding = nn.Linear(self.t_enc_dim, latent_dim)
@@ -244,6 +245,13 @@ class PerceiverIO(nn.Module):
         if cond_feat is not None:
                 delta = self.cond_cross_attn_layers[0](x, context=cond_feat)
                 x = x + torch.sigmoid(self.cond_scales[0]) * delta
+                printp = False
+                if (torch.rand((), device=x.device) < 0.1):
+                    printp = True
+                    print(
+                    x.detach().norm().item(),
+                    (torch.sigmoid(self.cond_scales[0]) * delta).detach().norm().item(),
+                    )
         x = cross_ff(x) + x
 
         for layer_idx, (self_attn, self_ff) in enumerate(self.layers):
@@ -251,6 +259,12 @@ class PerceiverIO(nn.Module):
             if layer_idx == len(self.layers) // 2 and cond_feat is not None:
                 delta = self.cond_cross_attn_layers[1](x, context=cond_feat)
                 x = x + torch.sigmoid(self.cond_scales[1]) * delta
+                if printp == True:
+                    print(
+                    x.detach().norm().item(),
+                    (torch.sigmoid(self.cond_scales[1]) * delta).detach().norm().item(),
+                    )
+       
             x = self_ff(x) + x
 
         if not exists(queries):

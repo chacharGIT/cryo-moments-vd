@@ -76,6 +76,11 @@ def load_filtered_state_dict_compat(model, ckpt_state, verbose=True):
     model_state.update(filtered)
     model.load_state_dict(model_state, strict=False)
 
+def debug_compare_scores(pred_score, true_score, prefix=""):
+    print(f"[DEBUG] {prefix} pred_score stats: min={pred_score.min().item():.4g}, max={pred_score.max().item():.4g}, mean={pred_score.mean().item():.4g}, std={pred_score.std().item():.4g}")
+    print(f"[DEBUG] {prefix} true_score stats: min={true_score.min().item():.4g}, max={true_score.max().item():.4g}, mean={true_score.mean().item():.4g}, std={true_score.std().item():.4g}")
+    diff = true_score - pred_score.squeeze(-1)
+    print(f"[DEBUG] {prefix} true_score - pred_score stats: min={diff.min().item():.4g}, max={diff.max().item():.4g}, mean={diff.mean().item():.4g}, std={diff.std().item():.4g}")
 def train(local_rank):
     CURRICULUM_SINGLE_EXAMPLE = False
     if CURRICULUM_SINGLE_EXAMPLE:
@@ -421,13 +426,7 @@ def train(local_rank):
             print(f"Epoch {epoch+1}/{settings.training.num_epochs} | Loss: {avg_loss:.6f}")
         else:
             print(f"Batch {batch_index} | Loss: {avg_loss:.6f}")
-        print(f"[DEBUG] pred_score stats (last batch): min={{:.4g}}, max={{:.4g}}, mean={{:.4g}}, std={{:.4g}}".format(
-            pred_score.min().item(), pred_score.max().item(), pred_score.mean().item(), pred_score.std().item()))
-        print(f"[DEBUG] true_score stats (last batch): min={{:.4g}}, max={{:.4g}}, mean={{:.4g}}, std={{:.4g}}".format(
-            true_score.min().item(), true_score.max().item(), true_score.mean().item(), true_score.std().item()))
-        diff = true_score - pred_score
-        print(f"[DEBUG] score diff (last batch): min={{:.4g}}, max={{:.4g}}, mean={{:.4g}}, std={{:.4g}}".format(
-            diff.min().item(), diff.max().item(), diff.mean().item(), diff.std().item()))
+        debug_compare_scores(pred_score, true_score)
         if avg_train_wait_count is not None:
             print(f"[DEBUG] Average train_wait_count per batch: {avg_train_wait_count:.2f}")
         # Save every epoch if use_conditional is True (conditional training), otherwise use interval logic

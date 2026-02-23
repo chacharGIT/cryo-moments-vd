@@ -73,9 +73,9 @@ def dpf_score_matching_loss(
 def partial_moment_loss(
     pred_distribution, true_distribution, volume, back_rotation, points,
      num_sampled_first=200, num_sampled_second=50, num_inplane_rotations=20,
-     lambda_1=0.02, lambda_2=0.1, single_volume_training=False, cached_first_moment=None,
+     lambda_1=5e-3, lambda_2=2e-2, single_volume_training=False, cached_first_moment=None,
     cached_second_moment=None, batch_func_base=None, aspire_volume=None
-):
+    ):
     """
     Computes L2 loss between partial second moments of predicted and true distributions,
     using a random subset of points. First moment is computed over all points.
@@ -84,17 +84,17 @@ def partial_moment_loss(
         pred_distribution (torch.Tensor): Predicted distribution, shape [N_points, ...]
         true_distribution (torch.Tensor): True distribution, shape [N_points, ...]
         volume (Volume): Aspire volume object
-        back_rotation (torch.Tensor): Rotation matrix to rotate the volume back from 
+        back_rotation (torch.Tensor): Rotation matrix to rotate the volume back from
         R_inv, shape [3, 3]
         points (torch.Tensor): S2 points, shape [N_points, 3]
         num_sampled_first (int): Number of points to subsample for first moment
         num_sampled_second (int): Number of points to subsample for second moment
-        num_inplane_rotations (int): Number of in-plane rotations to per S2 point.
+        num_inplane_rotations (int): Number of in-plane rotations to per S2 point
         lambda_1 (float): Weight for first moment loss
         lambda_2 (float): Weight for second moment loss
-        single_volume_training (bool): If True, uses only a single volume for training.
-        cached_first_moment (torch.Tensor or None): If provided, uses this precomputed first moment for all points.
-        cached_second_moment (torch.Tensor or None): If provided, uses this precomputed second moment for all points.
+        single_volume_training (bool): If True, uses only a single volume for training
+        cached_first_moment (torch.Tensor or None): If provided, uses this precomputed first moment for all points
+        cached_second_moment (torch.Tensor or None): If provided, uses this precomputed second moment for all points
 
     Returns:
         torch.Tensor: Scalar loss value

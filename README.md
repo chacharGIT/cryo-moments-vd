@@ -1,30 +1,49 @@
-# Cryo-EM Volume Distribution Analysis Framework
+# Cryo-EM Orientation Distribution Modeling (VDM + DPF)
 
-This repository provides a comprehensive framework for analyzing 3D molecular structures from cryo-electron microscopy data using Volume Distribution Models (VDM), statistical moments, and neural network architectures. The framework supports multiple distribution types including von Mises-Fisher (vMF) mixtures and S2 delta mixtures for modeling orientation distributions on SO(3).
+This repository contains a framework for learning and analyzing **orientation distributions** in cryo-EM using:
+- **Analytical moment / subspace features** derived from volumes and spherical harmonics–style representations, and
+- A **diffusion-based model on S²** (DPF) that learns a score field for functions sampled on the sphere.
 
-## Overview
+The codebase supports both **real EMDB volumes** and **synthetic distributions** (e.g., vMF mixtures), and provides end-to-end workflows for:
+1. downloading/loading volumes,
+2. generating moment/subspace datasets,
+3. training score-based models (including conditional variants), and
+4. sampling / inference with diffusion solvers.
 
-The framework addresses the cryo-EM inverse problem by representing molecular orientations as distributions over the rotation group SO(3) and using analytical moments as features for machine learning. It includes tools for real data acquisition from EMDB, synthetic data generation, spectral analysis, neural network training, and comprehensive data storage solutions.
+> Requirements: Python 3.12, PyTorch (see `requirements.txt`).  
+> Configuration lives in `config/parameters.yaml` (and `config/config.py`).
 
-## Key Features
+---
 
-### Volume Distribution Model (VDM)
-- **Core Architecture**: Object-oriented representation of 3D volumes with associated SO(3) distributions
-- **Distribution Support**: von Mises-Fisher mixtures and S2 delta mixtures with analytical moment computation
-- **ASPIRE Integration**: Direct compatibility with ASPIRE library for volume handling and projection operations
-- **Metadata Management**: Tracking of distribution parameters, shapes, and generation settings
+## Repository Layout
 
-### Data Management
-- **EMDB Integration**: Automated downloading and filtering of electron microscopy maps from EMDB database
-- **Real and Synthetic Data**: Tools for working with both real cryo-EM data and synthetic datasets
+- `src/networks/dpf/`  
+  Diffusion Probabilistic Field (DPF) components:
+  - **Score network** wrapping a Perceiver-style backbone
+  - **PerceiverIO** with optional **conditional cross-attention**
+  - Forward diffusion utilities (noise schedules, `q_sample`, etc.)
+  - Losses for score matching
+  - Conditional encoders (e.g., “moment encoders” producing `cond_feat` tokens)
 
-### Neural Networks
-- **VNN Architecture**: coVariance Neural Networks based on second moment data
-- **Multiple Loss Functions**: Support for Sinkhorn divergence, L2 loss, and distribution-specific losses
+- `src/data/`  
+  Dataset construction and IO:
+  - EMDB download/load helpers (ASPIRE integration)
+  - Dataset/dataloader builders for moment/subspace representations
+  - Volume splits / caching in `outputs/` (paths configurable)
 
-### Spectral Analysis
-- **Eigendecomposition**: Complete framework for second moment spectral analysis with GPU acceleration
-- **Visualization Tools**: Plotting capabilities for eigenvalues, eigenvectors, and distribution comparisons
+- `src/utils/`  
+  Math + geometry utilities used across the project:
+  - S² point generation (e.g., Fibonacci sphere)
+  - Rotation / interpolation utilities for spherical functions
+  - Spectral / moment processing helpers
+  - Visualization helpers
+
+- `src/` (core)
+  - Core objects for volumes/distributions (VDM)
+  - Common glue for configs, pipeline wiring, and shared primitives
+
+---
+
 
 ## Installation
 
@@ -61,23 +80,39 @@ eigenvalues, eigenvectors = perform_complete_spectral_analysis(
 )
 ```
 
-### 3. Train Neural Network
-```python
-# Single data training
-python src/training/train_moments_vnn_single.py
+## Training
 
-# Batch training
-python src/training/train_moments_vnn_batch.py
+### DPF training
+Main entrypoint:
+```bash
+python src/training/train_dpf.py
 ```
 
-## Project Structure
-- `src/`: Main source code
-  - `networks/`: Neural network architectures and loss functions
-  - `data/`: Data generation and preparation scripts
-  - `training/`: Training scripts and routines
-  - `utils/`: Helper functions for moments, batching, etc.
-  - `volume_distribution_model.py`: VDM object definition
-- `config/`: Configuration files (YAML, Python)
-- `outputs/`: Model checkpoints, logs, and results
-- `requirements.txt`: Python dependencies
+Notes:
+- Distributed training uses `torchrun` (if enabled in the script/config).
+- Conditional training can freeze most of the score model and train only:
+  - conditional cross-attention layers,
+  - conditional scales,
+  - optional time-modulation (gamma/beta) modules,
+  - plus the conditional encoder.
+
+(Exact behavior depends on `settings`.)
+
+---
+
+## Inference / Sampling
+
+Main entrypoint:
+```bash
+python src/inference/sample_from_dpf.py
+```
+
+Supported modes typically include:
+- `single`: evaluate score prediction and reconstruct `x0` from `x_t`
+- `diffusion`: run an iterative sampler/solver (e.g., DPM-Solver style)
+
+Outputs:
+- comparison plots of `x0`, `x_t`, predicted score, and reconstructed `x0_est`
+- optional conditional-vs-unconditional comparisons
+
 ---

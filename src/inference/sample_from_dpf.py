@@ -11,8 +11,7 @@ from src.networks.dpf.sample_generation import build_network_input, generate_vmf
 from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_schedule, beta_schedule
 from src.networks.dpf.conditional_moment_encoder import CryoMomentsConditionalEncoder
 from src.networks.dpf.torch_utils import rotate_s2_function_interpolated
-from src.training.train_dpf import load_filtered_state_dict_compat
-
+from src.training.train_dpf import load_filtered_state_dict_compat, debug_compare_scores
 
 def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_step_size=1e-2,
                                 cond_feat=None, use_guidance=False):
@@ -168,7 +167,7 @@ def plot_s2_comparison(points, plot_dict, t=None, save_path=None):
 if __name__ == "__main__":
     # Selection: plot single timestep or run full diffusion inference
     mode = "single" # "single" or "diffusion"
-    t_value = 0.5 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
+    t_value = 0.1 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
     plot_conditional_vs_unconditional_comparison = True
     use_guidance = True
     use_zarr_example = False
@@ -190,7 +189,7 @@ if __name__ == "__main__":
             cond_encoder = CryoMomentsConditionalEncoder().to(device)
             dataloader = create_subspace_moments_dataloader(zarr_path, batch_size=batch_size,
                                                                 shuffle=True, debug=True, mode='train', device=device)        
-    checkpoint = torch.load("./outputs/model_parameter_files/dpf_cond_2_batch_11100.pth", map_location=device, weights_only=False)
+    checkpoint = torch.load("./outputs/model_parameter_files/dpf_cond_3_batch_100.pth", map_location=device, weights_only=False)
     load_filtered_state_dict_compat(score_model, checkpoint["model_state_dict"], verbose=True)
     score_model = score_model.to(torch.float32)
     score_model.eval()
@@ -278,17 +277,25 @@ if __name__ == "__main__":
         scaling_t = cosine_signal_scaling_schedule(t).reshape(-1, *([1] * (x_t.dim() - 1)))
         x0_est = (x_t + pred_score.squeeze(-1) * (1 - scaling_t)) / torch.sqrt(scaling_t)
         true_score = -(x_t - torch.sqrt(scaling_t) * func_data) / (1 - scaling_t)
+        debug_compare_scores(pred_score, true_score, 'conditional')
         if plot_conditional_vs_unconditional_comparison:
             with torch.no_grad():
                     pred_score_uncond = score_model(context=context_encoding, queries=query_encoding, cond_feat=None)
             x0_est_uncond = (x_t + pred_score_uncond.squeeze(-1) * (1 - scaling_t)) / torch.sqrt(scaling_t)
+            debug_compare_scores(pred_score_uncond, true_score, 'unconditional')
+
             print("Conditional vs True difference (MSE):", torch.mean((func_data - x0_est) ** 2).item())
             print("Unconditional vs True difference (MSE):", torch.mean((func_data - x0_est_uncond) ** 2).item())
             plot_s2_comparison(points, {
                 "x_0 (clean)": func_data,
                 "x_t (noised)": x_t,
                 "x_0 est (network, conditional)": x0_est,
-                "x_0 est (network, unconditional)": x0_est_uncond
+                "x_0 est (network, unconditional)": x0_est_uncond,
+                "true score": true_score,
+                "pred score (conditional)": pred_score.squeeze(-1),
+                "score difference (conditional)": (true_score - pred_score.squeeze(-1)),
+                "pred score (unconditional)": pred_score_uncond.squeeze(-1),
+                "score difference (unconditional)": (true_score - pred_score_uncond.squeeze(-1)),
             }, t=t_value)
         else:        
             plot_s2_comparison(points, {
