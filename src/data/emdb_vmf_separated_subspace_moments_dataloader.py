@@ -1,4 +1,6 @@
 import warnings
+
+from matplotlib.pylab import single
 warnings.filterwarnings(
     "ignore",
     message="The codec `vlen-utf8` is currently not part in the Zarr format 3 specification. It may not be supported by other zarr implementations and may change in the future.",
@@ -233,32 +235,44 @@ class EMDBvMFSubspaceMomentsDataset(Dataset):
         return batch
     
 class ChunkShuffleIterableDataset(IterableDataset):
-    def __init__(self, dataset, batch_size=None, shuffle=True, device=None):
+    def __init__(self, dataset, batch_size=None, shuffle=True, device=None, single_volume_id=None):
         self.dataset = dataset
         self.shuffle = shuffle
         self.device = device
-
+        self.single_volume_id = single_volume_id
+        
         # Infer chunk size from first array of first volume
         zarr_root = dataset.root
-        first_volume_id = dataset.volume_ids[0]
+        if self.single_volume_id is not None:
+            first_volume_id = self.single_volume_id
+        else:
+            first_volume_id = dataset.volume_ids[0]
         first_group = zarr_root[first_volume_id]
         first_key = next(iter(first_group.array_keys()))
         self.chunk_size = first_group[first_key].chunks[0]
         
-        # Enforce batch_size as multiple of chunk_size
         if batch_size is None:
             batch_size = self.chunk_size
         self.batch_size = batch_size
 
     def __iter__(self):
         _err_print_every_s = 10.0
-        rank = 0
         world_size = 1
-        if dist.is_available() and dist.is_initialized():
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-        all_volume_ids = list(self.dataset.volume_to_indices.keys())
-        volume_ids = all_volume_ids[rank::world_size]
+
+        if self.single_volume_id is None:
+            rank = 0
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+            all_volume_ids = list(self.dataset.volume_to_indices.keys())
+            volume_ids = all_volume_ids[rank::world_size]
+        else:
+            if self.single_volume_id not in self.dataset.volume_to_indices:
+                raise KeyError(
+                    f"single_volume_id '{self.single_volume_id}' not found in dataset split. "
+                    f"Available volumes: {len(self.dataset.volume_to_indices)}"
+                )
+            volume_ids = [self.single_volume_id]
         n_samples_per_vol = {
             vid: len(self.dataset.volume_to_indices[vid]) for vid in volume_ids
         }
@@ -335,7 +349,7 @@ class ChunkShuffleIterableDataset(IterableDataset):
 
 def create_subspace_moments_dataloader(zarr_path: str, batch_size: int = None, 
                                       shuffle: bool = True, transform=None, num_workers: int = 0,
-                                      debug: bool = False, mode="train", device=None) -> DataLoader:
+                                      debug: bool = False, mode="train", device=None, single_volume_id=None) -> DataLoader:
     """
     Create a DataLoader for subspace moments EMDB data with vMF mixtures.
     Uses batch-level Zarr reading for efficiency with large samples.
@@ -355,7 +369,7 @@ def create_subspace_moments_dataloader(zarr_path: str, batch_size: int = None,
     dataset = EMDBvMFSubspaceMomentsDataset(zarr_path, transform=transform, debug=debug, mode=mode)
     if device is None:
         raise ValueError("Device must be specified for ChunkShuffleIterableDataset.")
-    iterable_dataset = ChunkShuffleIterableDataset(dataset, batch_size=batch_size, shuffle=shuffle, device=device)
+    iterable_dataset = ChunkShuffleIterableDataset(dataset, batch_size=batch_size, shuffle=shuffle, device=device, single_volume_id=single_volume_id)
     dataloader = DataLoader(
         iterable_dataset,
         num_workers=num_workers,
@@ -377,17 +391,26 @@ def to_device(batch, device):
 
 # Example usage and testing
 if __name__ == "__main__":
+    n_vectors_per_m_path = settings.dpf.conditional_separated_moment_encoder.cyclic_equivariant_attention.Nms_path
+    n_vectors_per_m = np.load(n_vectors_per_m_path, allow_pickle=True)
     import time
     zarr_path = "/data/shachar/zarr_files/emdb_vmf_subspace_moments_separated.zarr"
+    if settings.device.use_cuda:
+        device = f"cuda:{settings.device.cuda_device}"
+    else:
+        device = "cpu"
     
     dataloader = create_subspace_moments_dataloader(
         zarr_path, batch_size=300,
         shuffle=True,
         num_workers=0,
-        debug=False
+        debug=False,
+        device=device,
+        mode="train"
     )
     print(f"DataLoader created.")
     n_batches = 10
+    m_probe = -1
 
     start_time = time.time()
     r_vals = np.load(os.path.join("outputs", "model_static_parameters", "r_vals.npy"))
@@ -405,7 +428,7 @@ if __name__ == "__main__":
         print(f"sum(eigen_values) = {eigen_sums[0].item():.3e}, number of kept eigenvalues = {n_kept}")
         i = np.RankWarning
         try:
-            print(batch['eigen_values_by_m'][43].shape, batch['eigen_radial_by_m'][43].shape)
+            print(batch['eigen_values_by_m'][m_probe].shape, batch['eigen_radial_by_m'][m_probe].shape)
             print(sum(v.shape[1] for v in batch['eigen_values_by_m'].values()))
         except Exception as e:
             continue

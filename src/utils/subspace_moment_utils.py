@@ -153,27 +153,31 @@ def plot_angular_mode(eigenvector: np.ndarray, mode: int, radial_profile: np.nda
     plt.figure(figsize=(18, 6))
     # Original eigenvector
     plt.subplot(1, 3, 1)
-    plt.imshow(np.real(eigen_img), cmap='RdBu_r', aspect='equal')
-    plt.title("Original Eigenvector")
+    im = plt.imshow(np.real(eigen_img), cmap='RdBu_r', aspect='equal')
+    cbar = plt.colorbar(im)
+    cbar.ax.tick_params(labelsize=18)
+    plt.title("Original Eigenvector", fontsize=22)
     plt.axis('off')
-    plt.colorbar()
     # Reconstruction
     plt.subplot(1, 3, 2)
-    plt.imshow(np.real(recon_img), cmap='RdBu_r', aspect='equal')
-    plt.title(f"Reconstruction (mode={mode})")
+    im = plt.imshow(np.real(recon_img), cmap='RdBu_r', aspect='equal')
+    cbar = plt.colorbar(im)
+    cbar.ax.tick_params(labelsize=18)
+    plt.title(f"Reconstruction (mode={mode})", fontsize=22)
     plt.axis('off')
-    plt.colorbar()
     # Radial profile
     plt.subplot(1, 3, 3)
     if isinstance(radial_profile, (list, tuple)) or (isinstance(radial_profile, np.ndarray) and radial_profile.ndim == 2):
-        plt.plot(r_vals, np.real(radial_profile[0]), 'b-', linewidth=2, label='cos')
-        plt.plot(r_vals, np.real(radial_profile[1]), 'r-', linewidth=2, label='sin')
-        plt.legend()
+        plt.plot(r_vals, np.real(radial_profile[0]), 'b-', linewidth=2, label=r"$x_m(r)$ (real component)")
+        plt.plot(r_vals, np.real(radial_profile[1]), 'r-', linewidth=2, label=r"$y_m(r)$ (imag component)")
+        plt.legend(fontsize=16)
     else:
         plt.plot(r_vals, np.real(radial_profile), 'b-', linewidth=2, label='radial')
-    plt.title("Radial Profile")
-    plt.xlabel("Radius")
-    plt.ylabel("Value")
+    plt.title("Radial Profile", fontsize=25)
+    plt.xlabel("Radius", fontsize=25)
+    plt.ylabel("Value", fontsize=25)
+    plt.tick_params(axis='x', labelsize=22)
+    plt.tick_params(axis='y', labelsize=22)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -262,47 +266,40 @@ def plot_eigenvalues(eigenvalues: np.ndarray,
     # Plot eigenvalues
     ax1 = axes[0]
     ax1.plot(eigenvalues, 'b-', linewidth=2, marker='o', markersize=3)
-    ax1.set_xlabel('Eigenvalue Index')
-    ax1.set_ylabel('Eigenvalue')
-    ax1.set_title('Second Moment Eigenvalues')
+    ax1.set_xlabel('Eigenvalue Index', fontsize=25)
+    ax1.set_ylabel('Eigenvalue', fontsize=20)
+    ax1.tick_params(axis='x', labelsize=18)
+    ax1.tick_params(axis='y', labelsize=18)
     ax1.grid(True, alpha=0.3)
     
     if log_scale and np.any(eigenvalues > 0):
         ax1.set_yscale('log')
     
     # Add statistics text
-    total_energy = np.sum(eigenvalues)
+    total_energy = np.sum(eigenvalues**2)
     max_eig = np.max(eigenvalues)
     min_eig = np.min(eigenvalues)
-    
-    stats_text = f'Total Energy: {total_energy:.2e}\n'
-    stats_text += f'Max: {max_eig:.2e}\n'
-    stats_text += f'Min: {min_eig:.2e}\n'
-    stats_text += f'Ratio: {max_eig/max(min_eig, 1e-16):.1e}'
-    
-    ax1.text(0.98, 0.98, stats_text, transform=ax1.transAxes, 
-             verticalalignment='top', horizontalalignment='right',
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
     
     # Plot cumulative energy if requested
     if show_cumulative:
         ax2 = axes[1]
-        cumulative_energy = np.cumsum(eigenvalues) / total_energy
+        cumulative_energy = np.cumsum(eigenvalues**2) / total_energy
         ax2.plot(cumulative_energy, 'r-', linewidth=2)
-        ax2.set_xlabel('Number of Components')
-        ax2.set_ylabel('Cumulative Energy Fraction')
-        ax2.set_title('Cumulative Energy')
+        ax2.set_xlabel('Number of Components', fontsize=25)
+        ax2.set_ylabel('Cumulative Energy Fraction', fontsize=18)
+        ax2.tick_params(axis='x', labelsize=18)
+        ax2.tick_params(axis='y', labelsize=18)
         ax2.grid(True, alpha=0.3)
         ax2.set_ylim([0, 1])
         
         # Add lines for common thresholds
-        for threshold in [0.9, 0.95, 0.99]:
+        for threshold in [0.95, 0.99, 0.999]:
             idx = np.where(cumulative_energy >= threshold)[0]
             if len(idx) > 0:
                 ax2.axhline(y=threshold, color='gray', linestyle='--', alpha=0.7)
                 ax2.axvline(x=idx[0], color='gray', linestyle='--', alpha=0.7)
-                ax2.text(idx[0], threshold, f' {threshold*100:.0f}% @ {idx[0]}', 
-                        fontsize=9, verticalalignment='bottom')
+                ax2.text(idx[0], threshold, f' {threshold:g} # {idx[0]}',
+                fontsize=12, verticalalignment='bottom')
     
     plt.tight_layout()
     
@@ -365,26 +362,11 @@ def visualize_eigenvectors(eigenvectors: np.ndarray,
         for i,idx in enumerate(range(start_idx, end_idx)):
             # Reshape eigenvector to image
             eigenvec_img = eigenvectors[:, idx].reshape(L, L)
-
-            if is_complex:
-                # Real part (top row)
-                ax_real = axes[i]
-                im_real = ax_real.imshow(np.real(eigenvec_img), cmap='RdBu_r', aspect='equal')
-                ax_real.set_title(f'Real λ_{idx+1}={eigenvalues[idx]:.2e}', fontsize=10)
-                plt.colorbar(im_real, ax=ax_real, fraction=0.046, pad=0.04)
-                ax_real.axis('off')
-                # Imaginary part (bottom row)
-                ax_imag = axes[i + cols]
-                im_imag = ax_imag.imshow(np.imag(eigenvec_img), cmap='RdBu_r', aspect='equal')
-                ax_imag.set_title(f'Imag λ_{idx+1}={eigenvalues[idx]:.2e}', fontsize=10)
-                plt.colorbar(im_imag, ax=ax_imag, fraction=0.046, pad=0.04)
-                ax_imag.axis('off')
-            else:
-                ax = axes[i]
-                im = ax.imshow(eigenvec_img, cmap='RdBu_r', aspect='equal')
-                ax.set_title(f'λ_{idx+1} = {eigenvalues[idx]:.2e}', fontsize=10)
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                ax.axis('off')
+            ax = axes[i]
+            im = ax.imshow(eigenvec_img, cmap='RdBu_r', aspect='equal')
+            ax.set_title(f'λ_{idx+1} = {eigenvalues[idx]:.2e}', fontsize=24)
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.axis('off')
         
         # Hide unused subplots
         for j in range((end_idx-start_idx)*2 if is_complex else end_idx-start_idx, len(axes)):
@@ -486,7 +468,7 @@ def main():
     s2_distribution = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
     # quadrature_points, s2_distribution = generate_weighted_random_s2_points(1)
     so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
-                                                                            num_in_plane_rotations=320)
+                                                                            num_in_plane_rotations=80)
     vdm = VolumeDistributionModel(volume, rotations=so3_rotations, distribution=so3_weights, fourier_domain=False)
 
     # vdm = generate_vdm_from_volume(volume, 'vmf_mixture', downsample_size=downsample_size)
@@ -549,7 +531,7 @@ def main():
     print(f"  1 - 1e-4 energy in top: {num_components_for_energy_threshold(eigenvalues, 1e-4)} components")
     print(f"  1 - 1e-8 of energy in top: {num_components_for_energy_threshold(eigenvalues, 1e-8)} components")
     idx = np.random.randint(len(compressed_eigenspaces))
-    idx = 0
+    idx = 22
     eig = compressed_eigenspaces[idx]
     eigenvector = eigenvectors[:, idx]
     L = int(np.sqrt(eigenvectors.shape[0]))
@@ -570,6 +552,7 @@ def main():
                 print(f"{k}: {v}")
 
 if __name__ == "__main__":
+    """
     avg_counts = plot_m_detected_average_histogram(zarr_path="/data/shachar/zarr_files/emdb_vmf_subspace_moments_separated.zarr",
                                        save_path="outputs/spectral_analysis/m_detected_average_histogram.png")
     rounded_counts = np.round(avg_counts * 1.1).astype(int)
@@ -577,5 +560,6 @@ if __name__ == "__main__":
     last_nonzero = np.max(np.nonzero(rounded_counts)) + 1 if np.any(rounded_counts) else 0
     rounded_counts_trimmed = rounded_counts[:last_nonzero]
     print(f"Average m_detected counts (length {len(rounded_counts_trimmed)}):", rounded_counts_trimmed)
-    # Save trimmed array
     print(f"Sum of rounded counts: {rounded_counts_trimmed.sum()}")
+    """
+    main()

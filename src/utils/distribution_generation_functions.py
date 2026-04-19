@@ -30,6 +30,54 @@ def fibonacci_sphere_points(n: int):
     points = np.column_stack((x, y, z))
     return points
 
+def s2_points_to_in_plane_euler_angles(s2_points, num_in_plane_rotations=8, random_start=True):
+    """
+    Convert S2 points into SO(3) rotations by assigning
+    `num_in_plane_rotations` in-plane angles to each input point.
+
+    Parameters
+    ----------
+    s2_points : ndarray of shape (num_points, 3)
+        Points on the unit sphere in Cartesian coordinates.
+    num_in_plane_rotations : int
+        Number of in-plane rotations to generate per S2 point.
+    random_start : bool
+        If True, use a random starting in-plane angle per point.
+        If False, start at psi=0 for all points.
+
+    Returns
+    -------
+    euler_angles : ndarray of shape (len(s2_points) * num_in_plane_rotations, 3)
+        Array containing the Euler angles (phi, theta, psi) for each rotation.
+    """
+    num_s2_points = len(s2_points)
+
+    # Convert S2 Cartesian points to spherical coordinates (phi, theta)
+    phi = np.arctan2(s2_points[:, 1], s2_points[:, 0])
+    phi = np.where(phi < 0, phi + 2 * np.pi, phi)
+    theta = np.arccos(np.clip(s2_points[:, 2], -1, 1))
+
+    # Generate in-plane angles psi
+    if random_start:
+        psi_0 = np.random.uniform(0, 2 * np.pi, num_s2_points)
+    else:
+        psi_0 = np.zeros(num_s2_points, dtype=np.float32)
+
+    in_plane_angles = psi_0[:, None] + np.arange(num_in_plane_rotations) * 2 * np.pi / num_in_plane_rotations
+    psi_in_plane = in_plane_angles % (2 * np.pi)
+
+    # Repeat phi/theta for each in-plane angle
+    phi_s2 = np.repeat(phi[:, None], num_in_plane_rotations, axis=1)
+    theta_s2 = np.repeat(theta[:, None], num_in_plane_rotations, axis=1)
+
+    # Flatten to Euler angle arrays
+    phi_array = phi_s2.flatten()
+    theta_array = theta_s2.flatten()
+    psi_array = psi_in_plane.flatten()
+
+    euler_angles = np.stack([phi_array, theta_array, psi_array], axis=1)
+    return euler_angles
+
 def cartesian_to_spherical(points):
     """
     Convert normalized points in R^3 to spherical coordinates (phi, theta).
@@ -163,33 +211,19 @@ def create_in_plane_invariant_distribution(s2_points, s2_weights=None, num_in_pl
     """
     num_s2_points = len(s2_points)
     
-    # Create uniform weights if requested
     if is_s2_uniform or s2_weights is None:
-        s2_weights = np.ones(num_s2_points) / num_s2_points
-    
-    # Convert S2 Cartesian points to spherical coordinates (phi, theta)
-    phi = np.arctan2(s2_points[:, 1], s2_points[:, 0])
-    phi = np.where(phi < 0, phi + 2 * np.pi, phi)
-    theta = np.arccos(np.clip(s2_points[:, 2], -1, 1))
+        s2_weights = np.ones(num_s2_points, dtype=np.float32) / num_s2_points
+    else:
+        s2_weights = np.asarray(s2_weights, dtype=np.float32)
+        s2_weights = s2_weights / np.sum(s2_weights)
 
-    # Generate uniform in-plane rotation angles with a random starting angle
-    psi_0 = np.random.uniform(0, 2*np.pi, num_s2_points)
-    # For each S2 point, generate evenly spaced psi angles starting from psi_0
-    in_plane_angles = psi_0[:, None] + np.arange(num_in_plane_rotations) * 2 * np.pi / num_in_plane_rotations
-    psi_in_plane = in_plane_angles % (2 * np.pi)
-    # Use meshgrid to create all combinations efficiently
-    phi_s2 = np.repeat(phi[:, None], num_in_plane_rotations, axis=1)
-    theta_s2 = np.repeat(theta[:, None], num_in_plane_rotations, axis=1)
-    
-    # Flatten to get 1D arrays
-    phi_array = phi_s2.flatten()
-    theta_array = theta_s2.flatten()
-    psi_array = psi_in_plane.flatten()
+    euler_angles = s2_points_to_in_plane_euler_angles(
+        s2_points,
+        num_in_plane_rotations=num_in_plane_rotations,
+        random_start=True,
+    )
     
     distribution = np.repeat(s2_weights / num_in_plane_rotations, num_in_plane_rotations)
-    
-    # Stack angles for ASPIRE's from_euler
-    euler_angles = np.stack([phi_array, theta_array, psi_array], axis=1)
     # Create Rotation object (ZYZ convention)
     rotations = Rotation.from_euler(euler_angles, dtype=np.float32)
 

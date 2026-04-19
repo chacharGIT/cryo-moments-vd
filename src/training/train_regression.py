@@ -16,7 +16,6 @@ from src.data.emdb_downloader import load_aspire_volume
 from src.utils.distribution_generation_functions import fibonacci_sphere_points
 from src.networks.dpf.sample_generation import build_network_input
 from src.networks.dpf.score_network import S2ScoreNetwork
-from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_schedule
 from src.networks.dpf.loss import dpf_score_matching_loss, partial_moment_loss
 from src.networks.dpf.torch_utils import rotate_s2_function_interpolated
 
@@ -181,7 +180,8 @@ def train(local_rank):
         cond_encoder = DDP(cond_encoder, device_ids=[local_rank], find_unused_parameters=True)
 
     # Load model parameters
-    ckpt_path = settings.model.checkpoint.load_path
+    ckpt_path = settings.get("model.checkpoint.load_path", None)
+    checkpoint = None
     if ckpt_path:
         ckpt_path = os.path.expanduser(ckpt_path)
         if os.path.isfile(ckpt_path):
@@ -191,62 +191,66 @@ def train(local_rank):
                 checkpoint['model_state_dict'],
                 verbose=False
             )
-            if use_conditional:
-                learning_rate = settings.training.learning_rate
-                base_model_learning_rate = learning_rate * 0.05  # Lower LR for base model
-                if 'cond_encoder_state_dict' in checkpoint:
-                    load_filtered_state_dict_compat(
-                        cond_encoder,
-                        checkpoint['cond_encoder_state_dict'],
-                        verbose=False
-                    )
-                """
-                # Reinitialize conditional modules in the score model
-                def _reset(m):
-                    if hasattr(m, "reset_parameters"):
-                        m.reset_parameters()
-                smp = score_model.module.perceiver
-                smp.cond_cross_attn_layers.apply(_reset)
-                smp.t_latent_embedding.apply(_reset)
-
-                smp.gamma.apply(_reset)
-                torch.nn.init.zeros_(smp.gamma.weight)
-                if smp.gamma.bias is not None:
-                    torch.nn.init.zeros_(smp.gamma.bias)
-
-                smp.beta.apply(_reset)
-                torch.nn.init.zeros_(smp.beta.weight)
-                if smp.beta.bias is not None:
-                    torch.nn.init.zeros_(smp.beta.bias)
-                
-                with torch.no_grad():
-                    for p in smp.cond_scales:
-                        p.fill_(-5.0)
-                print("[INFO] Reinitialized conditional modules in the score model after loading checkpoint.")
-                """
-                # Lower LR for base model except for the conditional modules
-                smp = score_model.module.perceiver
-                conditional_modules = [smp.cond_cross_attn_layers, smp.cond_scales,
-                                       smp.t_latent_embedding, smp.gamma, smp.beta]
-                cond_param_ids = {id(p) for m in conditional_modules for p in m.parameters()}
-
-                backbone_parameters = [p for p in score_model.parameters() if id(p) not in cond_param_ids]
-                conditional_parameters = [p for p in score_model.parameters() if id(p) in cond_param_ids]
-
-                optimizer = torch.optim.Adam([
-                    {"params": backbone_parameters, "lr": base_model_learning_rate},
-                    {"params": conditional_parameters, "lr": learning_rate},
-                    {"params": cond_encoder.parameters(), "lr": learning_rate},
-                ])
-            else:
-                optim_params = [p for p in score_model.parameters() if p.requires_grad]
-                optimizer = torch.optim.Adam(optim_params, lr=settings.training.learning_rate)
-            # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if local_rank == 0:
-                print(f"Loaded model parameters from {ckpt_path} (strict=False)")
         else:
             if local_rank == 0:
                 print(f"Model parameters file not found at {ckpt_path}")
+    else:
+        if local_rank == 0:
+            print("No model checkpoint specified, starting training from scratch.")
+
+    if use_conditional:
+        learning_rate = settings.training.learning_rate
+        base_model_learning_rate = learning_rate  # Lower LR for base model
+        if checkpoint and 'cond_encoder_state_dict' in checkpoint:
+            load_filtered_state_dict_compat(
+                cond_encoder,
+                checkpoint['cond_encoder_state_dict'],
+                verbose=False
+            )
+        """
+        # Reinitialize conditional modules in the score model
+        def _reset(m):
+            if hasattr(m, "reset_parameters"):
+                m.reset_parameters()
+        smp = score_model.module.perceiver
+        smp.cond_cross_attn_layers.apply(_reset)
+        smp.t_latent_embedding.apply(_reset)
+
+        smp.gamma.apply(_reset)
+        torch.nn.init.zeros_(smp.gamma.weight)
+        if smp.gamma.bias is not None:
+            torch.nn.init.zeros_(smp.gamma.bias)
+
+        smp.beta.apply(_reset)
+        torch.nn.init.zeros_(smp.beta.weight)
+        if smp.beta.bias is not None:
+            torch.nn.init.zeros_(smp.beta.bias)
+        
+        with torch.no_grad():
+            for p in smp.cond_scales:
+                p.fill_(-5.0)
+        print("[INFO] Reinitialized conditional modules in the score model after loading checkpoint.")
+        """
+        # Lower LR for base model except for the conditional modules
+        smp = score_model.module.perceiver
+        conditional_modules = [smp.cond_cross_attn_layers, smp.cond_scales,
+                                smp.t_latent_embedding, smp.gamma, smp.beta]
+        cond_param_ids = {id(p) for m in conditional_modules for p in m.parameters()}
+
+        backbone_parameters = [p for p in score_model.parameters() if id(p) not in cond_param_ids]
+        conditional_parameters = [p for p in score_model.parameters() if id(p) in cond_param_ids]
+
+        optimizer = torch.optim.Adam([
+            {"params": backbone_parameters, "lr": base_model_learning_rate},
+            {"params": conditional_parameters, "lr": learning_rate},
+            {"params": cond_encoder.parameters(), "lr": learning_rate},
+        ])
+    else:
+        optim_params = [p for p in score_model.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(optim_params, lr=settings.training.learning_rate)
+        # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if local_rank == 0:
+        print(f"Loaded model parameters from {ckpt_path} (strict=False)")
 
     def batch_provider(batch_size=batch_size):
         if not use_conditional:
@@ -291,8 +295,7 @@ def train(local_rank):
         batch_func_base = batch['func_data']
         batch_func_base = batch_func_base / (batch_func_base.std(dim=1, keepdim=True) + 1e-8)
         current_batch_size = batch_func_base.shape[0]
-        t = torch.rand(current_batch_size, device=batch_func_base.device)
-        t = t.pow(0.17).clamp(min=1e-6, max=1.0-1e-6)  # Bias towards larger t
+        t = torch.zeros(current_batch_size, device=batch_func_base.device, dtype=torch.float32)  # const t=0.0
 
         if use_conditional:
             volume_id = batch["volume_id"][0]
@@ -314,23 +317,28 @@ def train(local_rank):
             batch_func = batch_func_candidates[0]  # Select the first candidate as the batch function
         else:
             batch_func = batch_func_base
-        x_t = q_sample(batch_func, t)
+            batch_func_candidates = None
+            R_inv = None
+        
+        x_in = torch.zeros_like(batch_func)
         context_encoding = build_network_input(
-            points, t, x_t,
+            points, t, x_in,
             time_enc_len=settings.dpf.time_encoding_len,
             sph_enc_len=settings.dpf.pos_encoding_max_harmonic_degree
         )
+
         context_encoding = context_encoding.to(dtype=torch.float32)
         query_encoding = context_encoding
 
-        pred_score = None
+        pred_func = None
         if use_conditional:
             drop_cond = torch.rand((), device=device) < p_drop_cond
             if dist.is_initialized():
                 dist.broadcast(drop_cond, src=0)
             drop_cond = bool(drop_cond.item())
+
             if drop_cond:
-                pred_score = model(context=context_encoding, queries=query_encoding, cond_feat=None)
+                pred_func = model(context=context_encoding, queries=query_encoding, cond_feat=None)
             else:
                 try:
                     if separate_fourier_modes:
@@ -346,64 +354,41 @@ def train(local_rank):
                             batch['first_moments'],
                             batch['eigen_values']
                         )
-                    pred_score = model(context=context_encoding, queries=query_encoding, cond_feat=conditional_encoding)
+                    pred_func = model(context=context_encoding, queries=query_encoding, cond_feat=conditional_encoding)
                 except Exception:
                     print(f"\n[ERROR] conditional path failed:\n{traceback.format_exc()}", flush=True)
                     return None, None, None
         else:
-            pred_score = model(context=context_encoding, queries=query_encoding)
+            pred_func = model(context=context_encoding, queries=query_encoding)
             
-        scaling_t = cosine_signal_scaling_schedule(t).reshape(-1, *([1] * (x_t.dim() - 1)))
-        scaling_t = scaling_t.clamp(min=1e-6, max=1.0 - 1e-6)
-        true_score = -(x_t - torch.sqrt(scaling_t) * batch_func) / (1 - scaling_t)
-        if pred_score.dim() == true_score.dim() + 1 and pred_score.shape[-1] == 1:
-            pred_score = pred_score.squeeze(-1)
+        if pred_func.dim() == batch_func.dim() + 1 and pred_func.shape[-1] == 1:
+            pred_func = pred_func.squeeze(-1)
 
         # Rotate predicted score on S^2 using the per-volume rotation (conditional case)
-        if use_conditional and not drop_cond:
-            candidate_losses = []
-            candidate_true_scores = []
-
-            for bf in batch_func_candidates:
-                rotated_ts = -(x_t - torch.sqrt(scaling_t) * bf) / (1 - scaling_t)
-                candidate_true_scores.append(rotated_ts)
-
+        if use_conditional and not drop_cond and not (CURRICULUM_SINGLE_VOLUME or CURRICULUM_SINGLE_EXAMPLE):
             per_item_losses = []
-            final_true_list = []
             final_func_list = []
             best_k_list = []
-            B = pred_score.shape[0]
+            B = pred_func.shape[0]
             for b in range(B):
-                # Force candidate 0 (no min)
-                if t[b].item() < 0.7:
-                    ts = candidate_true_scores[0][b:b+1]
-                    per_item_losses.append(dpf_score_matching_loss(pred_score[b:b+1], ts, scaling_t=scaling_t[b:b+1]))
-                    final_true_list.append(ts)
-                    final_func_list.append(batch_func_candidates[0][b:b+1])
-                    best_k_list.append(0)
-
-                # Pick best-of-4
-                else:
-                    losses_b = []
-                    for c in range(len(candidate_true_scores)):
-                        tsc = candidate_true_scores[c][b:b+1]
-                        losses_b.append(dpf_score_matching_loss(pred_score[b:b+1], tsc, scaling_t=scaling_t[b:b+1]))
-                    losses_b = torch.stack(losses_b)  # [4]
-                    best_k = int(torch.argmin(losses_b).item())
-                    per_item_losses.append(losses_b[best_k])
-                    final_true_list.append(candidate_true_scores[best_k][b:b+1])
-                    final_func_list.append(batch_func_candidates[best_k][b:b+1])
-                    best_k_list.append(best_k)
+                losses_b = []
+                for c in range(len(batch_func_candidates)):
+                    losses_b.append(dpf_score_matching_loss(pred_func[b:b+1],
+                                                            batch_func_candidates[c][b:b+1]))
+                losses_b = torch.stack(losses_b)  # [4]
+                best_k = int(torch.argmin(losses_b).item())
+                per_item_losses.append(losses_b[best_k])
+                final_func_list.append(batch_func_candidates[best_k][b:b+1])
+                best_k_list.append(best_k)
+                
             loss = torch.stack(per_item_losses).mean()
-            final_true_score = torch.cat(final_true_list, dim=0)  
-            final_batch_func = torch.cat(final_func_list, dim=0)  # [B, N]
+            final_true_func = torch.cat(final_func_list, dim=0)  
             final_k_per_item = torch.tensor(best_k_list, device=device, dtype=torch.long)  # [B]   
             # print(f"[DEBUG] number of items with best_k: {(final_k_per_item == 0).sum().item()} / {B}, {(final_k_per_item == 1).sum().item()} / {B}, {(final_k_per_item == 2).sum().item()} / {B}, {(final_k_per_item == 3).sum().item()} / {B}") 
             # print(f"[DEBUG] mean t: {t.mean().item()}")
         else:
-            final_true_score = true_score
-            loss = dpf_score_matching_loss(pred_score, final_true_score)
-            final_batch_func = batch_func
+            final_true_func = batch_func
+            loss = dpf_score_matching_loss(pred_func, final_true_func)
             final_k_per_item = None
 
         if use_conditional and not drop_cond:
@@ -437,7 +422,7 @@ def train(local_rank):
         raise Exception("Debugging moment consistency.")
         """
 
-        pred_distribution = ((1 - scaling_t) * pred_score + x_t)/torch.sqrt(scaling_t)
+        pred_distribution = pred_func
         if (CURRICULUM_SINGLE_EXAMPLE or CURRICULUM_SINGLE_VOLUME) and use_conditional and not drop_cond:
             nonlocal cached_first_moment, cached_second_moment
             if cached_first_moment is None or cached_second_moment is None:
@@ -486,7 +471,7 @@ def train(local_rank):
                             volume=aspire_volume,
                             back_rotation=back_rotation_variant,
                             pred_distribution=pred_distribution[idx],
-                            true_distribution=final_batch_func[idx],
+                            true_distribution=final_true_func[idx],
                             points=points,
                         )
                         if dpf_partial_moment_loss is not None and torch.isfinite(dpf_partial_moment_loss):
@@ -495,7 +480,7 @@ def train(local_rank):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        return loss.item(), pred_score, final_true_score
+        return loss.item(), pred_func, final_true_func
     def debug_and_save(avg_loss, pred_score, true_score, model, optimizer,cond_encoder=None, epoch=None, batch_index=None, avg_train_wait_count=None):
         if local_rank != 0:
             return  # Only let rank 0 print and save

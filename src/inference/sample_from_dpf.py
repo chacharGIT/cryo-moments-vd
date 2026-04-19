@@ -1,17 +1,75 @@
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import torch
 import numpy as np
 import zarr
 import random
+from tqdm import tqdm
+from aspire.utils.rotation import Rotation
 from packages.dpm_solver.dpm_solver_pytorch import model_wrapper, DPM_Solver
 
 from config.config import settings
+from src.utils.distribution_generation_functions import fibonacci_sphere_points, s2_points_to_in_plane_euler_angles
 from src.networks.dpf.score_network import S2ScoreNetwork
 from src.networks.dpf.sample_generation import build_network_input, generate_vmf_mixture_on_s2
 from src.networks.dpf.forward_diffusion import q_sample, cosine_signal_scaling_schedule, beta_schedule
 from src.networks.dpf.conditional_moment_encoder import CryoMomentsConditionalEncoder
 from src.networks.dpf.torch_utils import rotate_s2_function_interpolated
-from src.training.train_dpf import load_filtered_state_dict_compat, debug_compare_scores
+from src.networks.dpf.loss import dpf_score_matching_loss
+from src.training.train_dpf import load_filtered_state_dict_compat, debug_compare_items
+
+def best_sign_rotation_target_for_predscore(points, func_base, R_inv, mus, 
+                                            kappas, weights, x_t, scaling_t, pred_score):
+    """
+    Pick the best of the 4 sign-ambiguity rotations by comparing candidate true-scores to pred_score (batch_size=1).
+
+    Parameters:
+        points (torch.Tensor): S2 points, shape [N, 3].
+        func_base (torch.Tensor): Unrotated clean function, shape [1, N].
+        R_inv (np.ndarray): Base inverse rotation matrix, shape [3, 3].
+        mus: Mixture means passed to rotate_s2_function_interpolated.
+        kappas: Mixture kappas passed to rotate_s2_function_interpolated.
+        weights: Mixture weights passed to rotate_s2_function_interpolated.
+        x_t (torch.Tensor): Noisy sample generated from candidate 0, shape [1, N].
+        scaling_t (torch.Tensor): Alpha(t) scaling broadcastable to x_t, shape [1, 1] or [1, ...].
+        pred_score (torch.Tensor): Model score prediction, shape [1, N] or [1, N, 1].
+
+    Returns:
+        best_func (torch.Tensor): Selected rotated batch function, shape [1, N].
+        best_true_score (torch.Tensor): True score computed from (x_t, best_func), shape [1, N].
+        best_loss (torch.Tensor): Scalar loss value for the selected candidate.
+        best_idx (int): Index in {0,1,2,3} of the chosen sign configuration.
+    """
+    sign_configs = [
+    (1,  1,  1),
+    (1, -1, -1),
+    (-1, 1, -1),
+    (-1, -1, 1),
+    ]
+
+    # pred_score could be [1, N, 1] or [1, N]
+    if pred_score.dim() == 3 and pred_score.shape[-1] == 1:
+        pred_score = pred_score.squeeze(-1)
+
+    func_candidates = []
+    true_score_candidates = []
+    losses = []
+    for signs in sign_configs:
+        S = np.diag(signs).astype(np.float32)
+        R_inv_variant = S @ R_inv
+
+        bf = rotate_s2_function_interpolated(points, func_base, R_inv_variant, mus, kappas, weights)
+        bf = bf / (bf.std(dim=1, keepdim=True) + 1e-8)
+
+        ts = -(x_t - torch.sqrt(scaling_t) * bf) / (1 - scaling_t)
+
+        func_candidates.append(bf)
+        true_score_candidates.append(ts)
+        losses.append(dpf_score_matching_loss(pred_score, ts))  # scalar
+
+    losses = torch.stack(losses)  # [4]
+    best_idx = int(torch.argmin(losses).item())
+    return func_candidates[best_idx], true_score_candidates[best_idx], losses[best_idx], best_idx
 
 def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_step_size=1e-2,
                                 cond_feat=None, use_guidance=False):
@@ -64,7 +122,7 @@ def diffusion_inference_process(model, points, x_t_init, t_start=1.0, langevin_s
             if cond_feat is None or use_guidance:
                 score = model(context=context_encoding, queries=query_encoding).squeeze(-1)
         if cond_feat is not None and use_guidance:
-            w = 1 # Guidance weight
+            w = 0.3 # Guidance weight
             score = score + w * (cond_score - score)
         elif cond_feat is not None and not use_guidance:
             score = cond_score
@@ -113,6 +171,49 @@ def _adjust_checkpoint_keys(ckpt_state, model_state):
         ckpt_state = {k.replace('module.', '', 1): v for k, v in ckpt_state.items()}
     return ckpt_state
 
+def best_rotated_func_data(x0_est, func_data, mus, kappas, weights, points, num_in_plane_rotations):
+    """
+    Find the rotation of `func_data` that best matches `x0_est` in MSE.
+
+    Args:
+        x0_est (torch.Tensor): Estimated clean signal, shape [1, N] or [1, N, 1].
+        func_data (torch.Tensor): Reference clean signal to rotate, shape [1, N].
+        mus: Mean directions for `rotate_s2_function_interpolated`.
+        kappas: Concentration parameters for `rotate_s2_function_interpolated`.
+        weights: Mixture weights for `rotate_s2_function_interpolated`.
+        points (torch.Tensor or np.ndarray): Sphere points, shape [N, 3].
+        num_in_plane_rotations (int): Number of in-plane rotations per input point.
+
+    Returns:
+        best_func_data_rot (torch.Tensor): Rotated `func_data` with lowest MSE to `x0_est`.
+        best_loss (torch.Tensor): Best MSE value.
+        best_est_rot (np.ndarray): Rotation matrix of the best candidate.
+    """
+    if x0_est.dim() == 3 and x0_est.shape[-1] == 1:
+        x0_est = x0_est.squeeze(-1)
+
+    euler_angles = s2_points_to_in_plane_euler_angles(
+        fibonacci_sphere_points(150),
+        num_in_plane_rotations=num_in_plane_rotations,
+        random_start=True,
+    )
+    rotations = Rotation.from_euler(euler_angles, dtype=np.float32)
+
+    best_loss = None
+    best_idx = None
+    best_est_rot = None
+    for i, R in enumerate(tqdm(rotations.matrices, desc="Determining best rotation")):
+        func_data_rot = rotate_s2_function_interpolated(
+                points, func_data, R, mus, kappas, weights, use_residual_interpolation=False
+            )
+        loss = torch.mean((x0_est - func_data_rot) ** 2)
+
+        if best_loss is None or loss < best_loss:
+            best_loss = loss
+            best_est_rot = R
+            best_func_data_rot = func_data_rot
+
+    return best_func_data_rot, best_loss, best_est_rot
 
 def plot_s2_comparison(points, plot_dict, t=None, save_path=None):
     """
@@ -145,6 +246,26 @@ def plot_s2_comparison(points, plot_dict, t=None, save_path=None):
         else:
             arrs.append(v)
         titles.append(k)
+
+    def _minmax(vals):
+        vals = vals[np.isfinite(vals)]
+        vmin = float(vals.min())
+        vmax = float(vals.max())
+        if vmax > 0 and vmin < 0:
+            vmin = 0
+        return vmin, vmax
+
+    mask_top = points[:, 2] > 0
+    mask_bottom = points[:, 2] <= 0
+    top_vals = np.concatenate([a[mask_top].reshape(-1) for a in arrs], axis=0)
+    bot_vals = np.concatenate([a[mask_bottom].reshape(-1) for a in arrs], axis=0)
+    vmin_top, vmax_top = _minmax(top_vals)
+    vmin_bot, vmax_bot = _minmax(bot_vals)
+
+    gamma=0.5
+    norm_top = mcolors.PowerNorm(gamma=gamma, vmin=vmin_top, vmax=vmax_top)
+    norm_bot = mcolors.PowerNorm(gamma=gamma, vmin=vmin_bot, vmax=vmax_bot)
+
     n_cols = len(arrs)
     mask_top = points[:, 2] > 0
     mask_bottom = points[:, 2] <= 0
@@ -153,24 +274,31 @@ def plot_s2_comparison(points, plot_dict, t=None, save_path=None):
         axes = axes.reshape(2, 1)
     if t is not None:
         fig.suptitle(f"t = {float(t):.4f}", fontsize=20)
-    for row, mask in enumerate([mask_top, mask_bottom]):
+
+    for row, (mask, norm) in enumerate([(mask_top, norm_top), (mask_bottom, norm_bot)]):
         for col, (arr, title) in enumerate(zip(arrs, titles)):
-            sc = axes[row, col].scatter(points[mask, 0], points[mask, 1], c=arr[mask], cmap='viridis', alpha=0.8)
-            axes[row, col].set_title(title + (" (z>0)" if row==0 else " (z<0)"))
-            axes[row, col].set_xlabel('x')
-            axes[row, col].set_ylabel('y')
-            axes[row, col].set_aspect('equal')
-            plt.colorbar(sc, ax=axes[row, col])
+            ax = axes[row, col]
+            sc = ax.scatter(points[mask, 0], points[mask, 1], c=arr[mask],
+                            cmap='viridis', alpha=0.8, norm=norm)
+
+            ax.set_title(f"{title}\n" + ("(z>0)" if row == 0 else "(z<0)"), fontsize=15)
+            ax.set_aspect('equal')
+            ax.tick_params(axis='both', labelsize=20)
+
+            cbar = plt.colorbar(sc, ax=ax)
+            cbar.ax.tick_params(labelsize=20)
     plt.tight_layout()
     plt.savefig(save_path)
 
-if __name__ == "__main__":
+def main(return_mse=True):
     # Selection: plot single timestep or run full diffusion inference
-    mode = "single" # "single" or "diffusion"
-    t_value = 0.1 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
-    plot_conditional_vs_unconditional_comparison = True
+    mode = "diffusion" # "single" or "diffusion"
+    t_value = 1 # Starting time for diffusion inference/timestep for single mode (between 0 and 1, inference default = 1.0)
+    plot_conditional_vs_unconditional_comparison = False
     use_guidance = True
     use_zarr_example = False
+    compare_best_rotation = True
+
     device = torch.device(f"cuda:{settings.device.cuda_device}" if settings.device.use_cuda and torch.cuda.is_available() else "cpu")
     use_conditional = settings.dpf.conditional_moment_encoder.use_encoder
     separate_fourier_modes = settings.data_generation.separate_fourier_modes
@@ -184,12 +312,14 @@ if __name__ == "__main__":
             ).item()
         if separate_fourier_modes:
             from src.data.emdb_vmf_separated_subspace_moments_dataloader import create_subspace_moments_dataloader
-            from src.networks.dpf.conditional_separated_moment_encoder import CryoMomentsConditionalEncoder
+            #from src.networks.dpf.conditional_separated_moment_encoder import CryoMomentsConditionalEncoder
+            #cond_encoder = CryoMomentsConditionalEncoder().to(device)
+            from src.networks.dpf.simple_conditional_moment_encoder import DictComplexToBert
+            cond_encoder = DictComplexToBert().to(device)
             zarr_path = settings.data_generation.zarr.separated_modes_data_save_path
-            cond_encoder = CryoMomentsConditionalEncoder().to(device)
             dataloader = create_subspace_moments_dataloader(zarr_path, batch_size=batch_size,
-                                                                shuffle=True, debug=True, mode='train', device=device)        
-    checkpoint = torch.load("./outputs/model_parameter_files/dpf_cond_3_batch_100.pth", map_location=device, weights_only=False)
+                                                                shuffle=True, debug=True, mode='train', device=device, single_volume_id="emd_19777")        
+    checkpoint = torch.load("./outputs/model_parameter_files/dpf_cond_simple_3_batch_2400.pth", map_location=device, weights_only=False)
     load_filtered_state_dict_compat(score_model, checkpoint["model_state_dict"], verbose=True)
     score_model = score_model.to(torch.float32)
     score_model.eval()
@@ -200,16 +330,14 @@ if __name__ == "__main__":
 
     # Prepare S2 points
     n_points = settings.data_generation.von_mises_fisher.fibonacci_spiral_n
-    from src.utils.distribution_generation_functions import fibonacci_sphere_points
     points = fibonacci_sphere_points(n_points)
     points = torch.from_numpy(points).float().to(device)
-    #points = torch.from_numpy(points).float().unsqueeze(0).to(device)
 
     if use_conditional:
         if separate_fourier_modes:
             batch = next(iter(dataloader))
             batch_func_base = batch['distribution_evaluations'].float().to(device)
-            batch_func_base = batch_func_base / (batch_func_base.std(dim=1, keepdim=True) + 1e-10)
+            batch_func_base = batch_func_base / (batch_func_base.std(dim=1, keepdim=True) + 1e-8)
             volume_id = batch["volume_id"][0]
             R_vol_np = emdb_volumes_rotations[volume_id]["rotation"].astype(np.float32)
             R_inv = R_vol_np.T
@@ -234,6 +362,9 @@ if __name__ == "__main__":
             eigen_images = torch.from_numpy(z['eigen_images'][idx:idx+1]).float().to(device)
             eigen_values = torch.from_numpy(z['eigen_values'][idx:idx+1]).float().to(device)
             first_moments = torch.from_numpy(z['first_moments'][idx:idx+1]).float().to(device)
+            mus = torch.from_numpy(z['s2_distribution_means'][idx:idx+1]).float().to(device)
+            kappas = torch.from_numpy(z['s2_distribution_kappas'][idx:idx+1]).float().to(device)
+            weights = torch.from_numpy(z['s2_distribution_weights'][idx:idx+1]).float().to(device)
             # Instantiate conditional encoder
             D = eigen_images.shape[1]
             cond_encoder = CryoMomentsConditionalEncoder(
@@ -255,8 +386,7 @@ if __name__ == "__main__":
             _, func_data, _ = generate_vmf_mixture_on_s2(batch_size=batch_size)
             func_data = torch.from_numpy(func_data).float().to(device)
         cond_feat = None
-    func_data = func_data / (func_data.std(dim=1, keepdim=True))
-
+    func_data = func_data / (func_data.std(dim=1, keepdim=True) + 1e-8)
     if mode == 'single':
         t = torch.full((batch_size,), t_value, device=device)
         x_t = q_sample(func_data, t)
@@ -277,31 +407,31 @@ if __name__ == "__main__":
         scaling_t = cosine_signal_scaling_schedule(t).reshape(-1, *([1] * (x_t.dim() - 1)))
         x0_est = (x_t + pred_score.squeeze(-1) * (1 - scaling_t)) / torch.sqrt(scaling_t)
         true_score = -(x_t - torch.sqrt(scaling_t) * func_data) / (1 - scaling_t)
-        debug_compare_scores(pred_score, true_score, 'conditional')
+        debug_compare_items({'pred_score': pred_score, 'true_score': true_score}, 'conditional')
         if plot_conditional_vs_unconditional_comparison:
             with torch.no_grad():
                     pred_score_uncond = score_model(context=context_encoding, queries=query_encoding, cond_feat=None)
             x0_est_uncond = (x_t + pred_score_uncond.squeeze(-1) * (1 - scaling_t)) / torch.sqrt(scaling_t)
-            debug_compare_scores(pred_score_uncond, true_score, 'unconditional')
-
+            debug_compare_items({'pred_score': pred_score_uncond, 'true_score': true_score}, 'unconditional')
+            debug_compare_items({'x0_est': x0_est, 'func_data': func_data}, 'conditional')
             print("Conditional vs True difference (MSE):", torch.mean((func_data - x0_est) ** 2).item())
             print("Unconditional vs True difference (MSE):", torch.mean((func_data - x0_est_uncond) ** 2).item())
             plot_s2_comparison(points, {
                 "x_0 (clean)": func_data,
                 "x_t (noised)": x_t,
-                "x_0 est (network, conditional)": x0_est,
-                "x_0 est (network, unconditional)": x0_est_uncond,
-                "true score": true_score,
-                "pred score (conditional)": pred_score.squeeze(-1),
-                "score difference (conditional)": (true_score - pred_score.squeeze(-1)),
-                "pred score (unconditional)": pred_score_uncond.squeeze(-1),
-                "score difference (unconditional)": (true_score - pred_score_uncond.squeeze(-1)),
+                "x_0 estimate - conditional": x0_est,
+                "x_0 estimate - unconditional": x0_est_uncond,
+                #"true score": true_score,
+                #"pred score (conditional)": pred_score.squeeze(-1),
+                #"score difference (conditional)": (true_score - pred_score.squeeze(-1)),
+                #"pred score (unconditional)": pred_score_uncond.squeeze(-1),
+                #"score difference (unconditional)": (true_score - pred_score_uncond.squeeze(-1)),
             }, t=t_value)
         else:        
             plot_s2_comparison(points, {
                 "x_0 (clean)": func_data,
                 "x_t (noised)": x_t,
-                "x_0 est (network)": x0_est,
+                "x_0 reconstruction - network": x0_est,
             }, t=t_value)
         
             
@@ -312,6 +442,16 @@ if __name__ == "__main__":
         # cond_feat is None if not using conditional model
         x0_est = diffusion_inference_process(score_model, points, initial_image, t_start=t_value, cond_feat=cond_feat,
                                               use_guidance=use_guidance)
+
+        if compare_best_rotation:
+            best_func_data_rot, best_loss, best_est_rot = best_rotated_func_data(
+                x0_est, func_data, mus, kappas, weights, points, num_in_plane_rotations=8
+            )
+            func_data = best_func_data_rot
+            print(f"[INFO] Best conditional rotation MSE={best_loss.item():.6f}")
+            if return_mse == True:
+                return best_loss.item()
+
         if plot_conditional_vs_unconditional_comparison:
             x0_est_uncond = diffusion_inference_process(score_model, points, initial_image, t_start=t_value, cond_feat=None,
                                                          use_guidance=use_guidance)
@@ -321,6 +461,7 @@ if __name__ == "__main__":
                 "x_0 est (diffusion, conditional)": x0_est,
                 "x_0 est (diffusion, unconditional)": x0_est_uncond
             }, t=None)
+            
             print("Conditional vs True difference (MSE):", torch.mean((func_data - x0_est) ** 2).item())
             print("Unconditional vs True difference (MSE):", torch.mean((func_data - x0_est_uncond) ** 2).item())
         else:
@@ -331,3 +472,14 @@ if __name__ == "__main__":
             }, t=None)
     else:
         print("Invalid mode. Please choose 'single' or 'diffusion'.")
+
+if __name__ == "__main__":
+    diffs = []
+    for i in tqdm(range(1)):
+        diff_mse = main(return_mse=False)
+        diffs.append(diff_mse)
+
+    diffs = np.array(diffs, dtype=np.float64)
+    print(f"Average MSE over {len(diffs)} runs: {diffs.mean():.6f}")
+    print(f"Std MSE over {len(diffs)} runs: {diffs.std():.6f}")
+

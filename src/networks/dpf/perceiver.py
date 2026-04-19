@@ -111,7 +111,7 @@ class Attention(nn.Module):
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
-            dropout_p=0.05 if self.training else 0.0,
+            dropout_p=0.00 if self.training else 0.0,
             is_causal=False,
         )  
         out = rearrange(out, 'b h n d -> b n (h d)', h=h)
@@ -161,7 +161,6 @@ class PerceiverIO(nn.Module):
                  seq_dropout_prob,
                  logits_dim=None,
                  ff_mult=4,
-                 p_drop_cond=0.1
                  ):
         super().__init__()
         self.seq_dropout_prob = seq_dropout_prob
@@ -185,8 +184,6 @@ class PerceiverIO(nn.Module):
         self.to_logits = nn.Linear(queries_dim, logits_dim) if exists(logits_dim) else nn.Identity()
         # Learnable scaling for function value channels (assumed last channel)
         self.func_scale = nn.Parameter(torch.ones(1) * 1e3)
-
-        self.p_drop_cond = p_drop_cond
         self.cond_cross_attn_layers = nn.ModuleList([
             PreNorm(
                 latent_dim,
@@ -205,7 +202,7 @@ class PerceiverIO(nn.Module):
         self.apply(xavier_init_linear)
         
         self.cond_scales = nn.ParameterList([
-            nn.Parameter(torch.tensor(-1.0)) for _ in range(2)
+            nn.Parameter(torch.tensor(-3.0)) for _ in range(2)
         ])
         self.t_enc_dim = settings.dpf.time_encoding_len
         self.t_latent_embedding = nn.Linear(self.t_enc_dim, latent_dim)
@@ -229,24 +226,21 @@ class PerceiverIO(nn.Module):
         x = repeat(self.latents, 'n d -> b n d', b=b)
         # Additive conditioning: add cond_feat to latents if provided
         if cond_feat is not None:
-            if self.training and torch.rand(()) < self.p_drop_cond:
-                cond_feat = None
-            else:
-                t_enc = data[:, 0, :self.t_enc_dim]                 # [B, t_enc_dim]
-                t_enc = t_enc.to(dtype=cond_feat.dtype, device=cond_feat.device)
-                t_emb = self.t_latent_embedding(t_enc)             # [B, latent_dim]
-                gamma = self.gamma(t_emb).unsqueeze(1)             # [B, 1, latent_dim]
-                beta = self.beta(t_emb).unsqueeze(1)               # [B, 1, latent_dim]
-                cond_feat = cond_feat * (1.0 + gamma) + beta       # [B, Q, latent_dim]
+            t_enc = data[:, 0, :self.t_enc_dim]                 # [B, t_enc_dim]
+            t_enc = t_enc.to(dtype=cond_feat.dtype, device=cond_feat.device)
+            t_emb = self.t_latent_embedding(t_enc)             # [B, latent_dim]
+            gamma = self.gamma(t_emb).unsqueeze(1)             # [B, 1, latent_dim]
+            beta = self.beta(t_emb).unsqueeze(1)               # [B, 1, latent_dim]
+            cond_feat = cond_feat * (1.0 + gamma) + beta       # [B, Q, latent_dim]
         cross_attn, cross_ff = self.cross_attend_blocks
         if self.training and self.seq_dropout_prob > 0.:
             data, mask = dropout_seq(data, mask, self.seq_dropout_prob)
         x = cross_attn(x, context=data, mask=mask) + x
         if cond_feat is not None:
-                delta = self.cond_cross_attn_layers[0](x, context=cond_feat)
+                delta = 120 * self.cond_cross_attn_layers[0](x, context=cond_feat)
                 x = x + torch.sigmoid(self.cond_scales[0]) * delta
                 printp = False
-                if (torch.rand((), device=x.device) < 0.1):
+                if (torch.rand((), device=x.device) < 0.01):
                     printp = True
                     print(
                     x.detach().norm().item(),
@@ -257,7 +251,7 @@ class PerceiverIO(nn.Module):
         for layer_idx, (self_attn, self_ff) in enumerate(self.layers):
             x = self_attn(x) + x
             if layer_idx == len(self.layers) // 2 and cond_feat is not None:
-                delta = self.cond_cross_attn_layers[1](x, context=cond_feat)
+                delta = 2000 * self.cond_cross_attn_layers[1](x, context=cond_feat)
                 x = x + torch.sigmoid(self.cond_scales[1]) * delta
                 if printp == True:
                     print(

@@ -46,7 +46,7 @@ def fit_vmf_mu(eval_points, values):
     mu_hat = weighted_sum / (weighted_sum.norm() + 1e-13)
     return mu_hat
 
-def rotate_s2_function_interpolated(grid_points, rho, R, mus, kappas, weights):
+def rotate_s2_function_interpolated(grid_points, rho, R, mus, kappas, weights, use_residual_interpolation=True):
     """
     Rotate in plane invariant euler angle distribution by R,
       using nearest neighbour exponential kernel interpolation.
@@ -65,6 +65,9 @@ def rotate_s2_function_interpolated(grid_points, rho, R, mus, kappas, weights):
         Concentration parameters for von Mises-Fisher distributions.
     weights : torch.Tensor, shape (B, num_distributions)
         Weights for von Mises-Fisher distributions.
+    use_residual_interpolation : bool, optional
+        If True, add the residual nearest-neighbour exponential-kernel correction.
+        If False, return only the rotated fitted vMF approximation.
 
     Returns
     -------
@@ -122,7 +125,25 @@ def rotate_s2_function_interpolated(grid_points, rho, R, mus, kappas, weights):
             mu_hat = fit_vmf_mu(eval_points_torch, vmf_values)
             new_mus[b, i] = mu_hat
 
-    # Build vMF mixture on eval_points with new mus (loop over batch; numpy impl is not batched)
+     # Analytic approx on grid_points using new_mus, same kappas and weights
+    approx_grid_vmf_list = []
+    for b in range(B):
+        approx_grid_b = evaluate_vmf_mixture(
+            grid_points_np,    # (N, 3) numpy
+            new_mus[b].detach().cpu().numpy().astype(np.float64),     # (num_distributions, 3) numpy
+            kappas[b].detach().cpu().numpy().astype(np.float64),      # (num_distributions,) numpy
+            weights[b].detach().cpu().numpy().astype(np.float64),     # (num_distributions,) numpy
+        )  # (N,) numpy
+        approx_grid_b = approx_grid_b / (approx_grid_b.sum() + 1e-13) * rho_normalization[b].item()  # Normalize to have same sum as original rho
+        approx_grid_vmf_list.append(torch.from_numpy(approx_grid_b).to(device=device, dtype=dtype))
+    approx_grid_vmf = torch.stack(approx_grid_vmf_list, dim=0)  # (B, N)
+    
+    if not use_residual_interpolation:
+        rho_rot_grid = torch.clamp(approx_grid_vmf, min=0)
+        rho_rot_grid = rho_rot_grid / (rho_rot_grid.sum(dim=1, keepdim=True) + 1e-13) * rho_normalization
+        return rho_rot_grid
+
+    # Build vMF mixture on eval_points
     approx_eval_vmf_list = []
     for b in range(B):
         approx_b = evaluate_vmf_mixture(
@@ -134,6 +155,7 @@ def rotate_s2_function_interpolated(grid_points, rho, R, mus, kappas, weights):
         approx_b = approx_b / (approx_b.sum() + 1e-13) * rho_normalization[b].item()  # Normalize to have same sum as original rho
         approx_eval_vmf_list.append(torch.from_numpy(approx_b).to(device=device, dtype=dtype))
     approx_eval_vmf = torch.stack(approx_eval_vmf_list, dim=0)  # (B, N)
+
     diff = rho - approx_eval_vmf # (B, N)
     # Pointwise dot-products between eval points and grid points
     sims = eval_points_torch @ grid_points.t()  # (N, N)
@@ -156,19 +178,6 @@ def rotate_s2_function_interpolated(grid_points, rho, R, mus, kappas, weights):
         diff_interpolated_list.append((w.unsqueeze(0) * diff_neighbors).sum(dim=1))  # (B, N)
 
     diff_grid_interpolated = torch.stack(diff_interpolated_list, dim=0).mean(dim=0)  # (B, N)
-
-     # Analytic approx on grid_points using new_mus ----
-    approx_grid_vmf_list = []
-    for b in range(B):
-        approx_grid_b = evaluate_vmf_mixture(
-            grid_points_np,    # (N, 3) numpy
-            new_mus[b].detach().cpu().numpy().astype(np.float64),     # (num_distributions, 3) numpy
-            kappas[b].detach().cpu().numpy().astype(np.float64),      # (num_distributions,) numpy
-            weights[b].detach().cpu().numpy().astype(np.float64),     # (num_distributions,) numpy
-        )  # (N,) numpy
-        approx_grid_b = approx_grid_b / (approx_grid_b.sum() + 1e-13) * rho_normalization[b].item()  # Normalize to have same sum as original rho
-        approx_grid_vmf_list.append(torch.from_numpy(approx_grid_b).to(device=device, dtype=dtype))
-    approx_grid_vmf = torch.stack(approx_grid_vmf_list, dim=0)  # (B, N)
     
     rho_rot_grid = approx_grid_vmf + diff_grid_interpolated
     rho_rot_grid = torch.clamp(rho_rot_grid, min=0)

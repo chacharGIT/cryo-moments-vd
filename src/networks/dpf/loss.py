@@ -22,6 +22,7 @@ def variance_weighting(base_value, true, pred):
 
 def dpf_score_matching_loss(
     pred_score, true_score,
+    scaling_t=None,
     scale_invariant=True,
     variance_matching=False, lambda_var=2.5,
     correlation_matching=False, lambda_corr=0.3,
@@ -44,7 +45,12 @@ def dpf_score_matching_loss(
     Returns:
         torch.Tensor: Scalar loss value.
     """
-    mse = torch.mean((pred_score - true_score) ** 2)
+    mse_per = ((pred_score - true_score) ** 2).flatten(1).mean(dim=1)  # [B]
+    if scaling_t is not None:
+        alpha = scaling_t.to(dtype=torch.float32).clamp(min=1e-6, max=1.0-1e-6)  # [B]
+        w = ((1.0 - alpha) ** 2 / alpha).clamp(max=float(1e02))        # [B]
+        mse_per = mse_per * w
+    mse = mse_per.mean()
     if scale_invariant:
         mse = variance_weighting(mse, true_score, pred_score)
     if variance_matching:
@@ -72,8 +78,8 @@ def dpf_score_matching_loss(
 
 def partial_moment_loss(
     pred_distribution, true_distribution, volume, back_rotation, points,
-     num_sampled_first=200, num_sampled_second=50, num_inplane_rotations=20,
-     lambda_1=5e-3, lambda_2=2e-2, single_volume_training=False, cached_first_moment=None,
+     num_sampled_first=512, num_sampled_second=512, num_inplane_rotations=64,
+     lambda_1=0.2, lambda_2=0.4, single_volume_training=False, cached_first_moment=None,
     cached_second_moment=None, batch_func_base=None, aspire_volume=None
     ):
     """
@@ -99,7 +105,7 @@ def partial_moment_loss(
     Returns:
         torch.Tensor: Scalar loss value
     """
-    max_loss = 1e3
+    clamp_loss = 1e3
     device = points.device
     # Subsample points with probability proportional to mean true_distribution over batch
     probs = true_distribution.mean(dim=0)
@@ -164,14 +170,24 @@ def partial_moment_loss(
 
     # Compute weighted sum for first moment and second moment differences
     weights = pred_distribution[:, idx_first] - true_distribution[:, idx_first]  # [B, N]
-    first_moment_diff = torch.einsum('bn,n...->b...', weights, first_moment_components)
-    first_moment_loss = first_moment_diff.flatten(1).norm(dim=1).mean()
+    partial_first_moment_diff = torch.einsum('bn,n...->b...', weights, first_moment_components)
+    partial_first_diff_norm = partial_first_moment_diff.flatten(1).norm(dim=1)
+    partial_first_moment_true = torch.einsum('bn,n...->b...', true_distribution[:, idx_first], first_moment_components)
+    partial_first_true_norm = partial_first_moment_true.flatten(1).norm(dim=1).clamp_min(1e-8)
+    first_moment_loss = (partial_first_diff_norm / partial_first_true_norm).mean()
+
     weights = weights[:, idx_second_in_first]  # [B, num_sampled]
     partial_second_moment_diff = torch.einsum('bn,n...->b...', weights.to(torch.float16), second_moment_components)
-    second_moment_loss = partial_second_moment_diff.flatten(1).norm(dim=1).mean()
+    partial_second_diff_norm = partial_second_moment_diff.to(torch.float32).flatten(1).norm(dim=1)
+    td = true_distribution[:, idx_second]  # [B, num_sampled]
+    partial_second_moment_true = torch.einsum('bn,n...->b...', td.to(torch.float16), second_moment_components)
+    partial_second_true_norm = partial_second_moment_true.to(torch.float32).flatten(1).norm(dim=1).clamp_min(1e-8)
+    second_moment_loss = (partial_second_diff_norm / partial_second_true_norm).mean()
+
     base_loss = (lambda_1 * first_moment_loss + lambda_2 * second_moment_loss)
     weighted_loss = base_loss
-    loss = torch.clamp(weighted_loss, max=max_loss)
+    loss = torch.clamp(weighted_loss, max=clamp_loss)
+    # print(f"Partial moment loss: {loss.item():.4f} (first moment: {first_moment_loss.item():.4f}, second moment: {second_moment_loss.item():.4f})")
     if single_volume_training:
         if cached_first_moment is None or cached_second_moment is None:
             # Return loss and cached tensors for first call
