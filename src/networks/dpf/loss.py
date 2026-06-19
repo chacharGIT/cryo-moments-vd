@@ -1,6 +1,8 @@
 import torch
 import numpy as np
+from geomloss import SamplesLoss
 
+from config.config import settings
 from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution
 from src.core.volume_distribution_model import VolumeDistributionModel
 
@@ -187,7 +189,7 @@ def partial_moment_loss(
     base_loss = (lambda_1 * first_moment_loss + lambda_2 * second_moment_loss)
     weighted_loss = base_loss
     loss = torch.clamp(weighted_loss, max=clamp_loss)
-    # print(f"Partial moment loss: {loss.item():.4f} (first moment: {first_moment_loss.item():.4f}, second moment: {second_moment_loss.item():.4f})")
+    #print(f"Partial moment loss: {loss.item():.4f} (first moment: {first_moment_loss.item():.4f}, second moment: {second_moment_loss.item():.4f})")
     if single_volume_training:
         if cached_first_moment is None or cached_second_moment is None:
             # Return loss and cached tensors for first call
@@ -196,3 +198,31 @@ def partial_moment_loss(
             return loss
     else:
         return loss
+
+def wasserstein_loss(pred_distribution, true_distribution, points, lambda_sinkhorn=9.0):
+    """
+    Computes the Wasserstein distance between two distributions using geomloss.
+
+    Args:
+        pred_distribution (torch.Tensor): Predicted distribution, shape [B, N]
+        true_distribution (torch.Tensor): True distribution, shape [B, N]
+        points (torch.Tensor): S2 points corresponding to the distributions, shape [N, 3]
+
+    Returns:
+        torch.Tensor: Scalar loss value representing the Wasserstein distance
+    """
+    # Ensure distributions are normalized
+    pred_distribution = pred_distribution / (pred_distribution.sum(dim=1, keepdim=True) + 1e-8)
+    true_distribution = true_distribution / (true_distribution.sum(dim=1, keepdim=True) + 1e-8)
+
+    # Compute approximate Wasserstein distance
+    p = settings.regression.loss.sinkhorn.p
+    blur = settings.regression.loss.sinkhorn.blur
+    loss_fn = SamplesLoss(loss="sinkhorn", p=p, blur=blur)  
+
+    batch_size = pred_distribution.shape[0]
+    points_batched = points.unsqueeze(0).expand(batch_size, -1, -1).contiguous() 
+    wasserstein_distance = (lambda_sinkhorn * loss_fn(pred_distribution, points_batched,
+                                                      true_distribution, points_batched)).mean()
+    #print(f"Wasserstein distance: {wasserstein_distance.item():.4f}")
+    return wasserstein_distance

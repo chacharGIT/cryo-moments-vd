@@ -1,3 +1,4 @@
+from networkx import sigma
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -94,14 +95,15 @@ class VolumeDistributionModel:
         Returns
         -------
         rotations : ndarray
-            Array of sampled rotations (SO(3) points).
+            Array of sampled aspire rotations (SO(3) points).
         """
         if not self.in_plane_invariant_distribution:
             if s2_points is not None:
                     import warnings
                     warnings.warn("s2_points is set but in_plane_invariant_distribution is False. Ignoring s2_points.")
                     
-            return np.random.choice(len(self.rotations), size=num_rotations, p=self.distribution)
+            idx = np.random.choice(len(self.rotations), size=num_rotations, p=self.distribution)
+            return self.rotations[idx]
         else:
             if s2_points is not None:
                 s2_points = np.asarray(s2_points)
@@ -183,7 +185,6 @@ class VolumeDistributionModel:
             # Non-invariant case
             if num_projections is not None and rotations_to_project is None:
                 rotations_to_project = self.sample_rotations(num_rotations=num_projections)
-        
         projections = self.volume.project(rotations_to_project).asnumpy()
         noise = np.random.normal(0, sigma, projections.shape)
         projections = projections + noise
@@ -278,6 +279,8 @@ class VolumeDistributionModel:
             Whether to show a progress bar.
         dtype : torch.dtype
             Data type for computation (e.g., torch.float32 or torch.float64).
+        return_torch : bool
+            If True, return the second moment as a PyTorch tensor. If False, return as a NumPy array.
 
         Returns:
         --------
@@ -293,11 +296,10 @@ class VolumeDistributionModel:
         if self.fourier_domain:
             dtype = torch.complex128 if dtype == torch.float64 else torch.complex64
         second_moment = torch.zeros((L, L, L, L), dtype=dtype, device=device)
+        
         projections = self.generate_projections(self.rotations)
-        # projections = self.volume.project(self.rotations).asnumpy().copy()  # shape: (N, L, L), ensure writeable
         projections_t = torch.from_numpy(projections).to(device=device, dtype=dtype)
         weights_t = torch.from_numpy(self.distribution).to(device=device, dtype=dtype)
-
         iterator = range(0, N, batch_size)
         if show_progress:
             iterator = tqdm(iterator, total=(N + batch_size - 1) // batch_size, desc="Second Moment", leave=False)
@@ -361,6 +363,50 @@ class VolumeDistributionModel:
         sketch = torch.einsum('nd,ns->nds', I_hat, v1 * v2)  # (N, d, s)
         sketch = sketch.mean(dim=0)  # (d, s)
         return sketch
+    def empirical_moments(self, num_projections, sigma, batch_size, show_progress=True, dtype=torch.float64):
+        """
+        Compute empirical first and second moments from a large number of generated projections, using batching to manage memory.
+
+        Parameters:
+        -----------
+        num_projections : int
+            Total number of projections to generate for empirical estimation.
+        sigma : float
+            Standard deviation of the Gaussian noise to add to the projections.
+        batch_size : int
+            Number of projections to process in each batch.
+        show_progress : bool
+            Whether to display a progress bar.
+        dtype : torch.dtype, optional
+            Data type for the empirical moments.
+
+        Returns:
+        --------
+        empirical_first_moment : ndarray of shape (L, L)
+            Empirical first moment computed from the generated projections.
+        empirical_second_moment : ndarray of shape (L, L, L, L)
+            Empirical second moment computed from the generated projections.
+        """
+        L = self.volume.resolution
+        if self.device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            device = self.device
+        empirical_first_moment = torch.zeros((L, L), dtype=dtype, device=device)
+        empirical_second_moment = torch.zeros((L, L, L, L), dtype=dtype, device=device)
+        
+        num_batches = (num_projections + batch_size - 1) // batch_size
+        for i in tqdm(range(num_batches), desc="Empirical Moments", leave=False):
+            current_batch_size = min(batch_size, num_projections - i * batch_size)
+            projections = self.generate_projections(num_projections=current_batch_size, sigma=sigma)
+            projections_t = torch.from_numpy(projections).to(device=device, dtype=dtype)
+            empirical_first_moment += torch.sum(projections_t, dim=0)
+            empirical_second_moment += torch.einsum('bij,bkl->ijkl', projections_t, projections_t)
+        
+        empirical_first_moment /= num_projections
+        empirical_second_moment /= num_projections
+        empirical_second_moment = empirical_second_moment - torch.eye(L*L, device=device, dtype=dtype).reshape(L, L, L, L) * sigma**2
+        return empirical_first_moment.cpu().numpy(), empirical_second_moment.cpu().numpy()
 
 if __name__ == "__main__":
 
@@ -372,13 +418,14 @@ if __name__ == "__main__":
     # Load volume and ensure mean zero
     from src.data.emdb_downloader import load_aspire_volume
     downsample_size = settings.data_generation.downsample_size
+    device = torch.device(f"cuda:{settings.device.cuda_device}" if settings.device.use_cuda and torch.cuda.is_available() else "cpu")
 
-    emdb_id = "emd_47031"
+    emdb_id = "emd_19777"
     emdb_path = f"/data/shachar/emdb_downloads/{emdb_id}.map.gz"
     save_dir = f"outputs/spectral_analysis/{emdb_id}"
     
     # Generate VDM using the generator
-    print("\n1. Loading volume and generating VDM...")
+    print("Loading volume and generating VDM...")
     volume = load_aspire_volume(emdb_path, downsample_size=settings.data_generation.downsample_size)
     vol_ds = volume.downsample(downsample_size)
     L = vol_ds.resolution
@@ -395,7 +442,7 @@ if __name__ == "__main__":
         vmf_cfg.num_distributions, kappa_start=vmf_cfg.kappa_start, kappa_mean=vmf_cfg.kappa_mean
     )
     s2_distribution = evaluate_vmf_mixture(quadrature_points, mu, kappa, weights)
-
+    """
     from src.utils.distribution_generation_functions import generate_weighted_random_s2_points
     import numpy as np
     # quadrature_points, s2_distribution = generate_weighted_random_s2_points(1)
@@ -407,38 +454,91 @@ if __name__ == "__main__":
                                         'kappas': kappa,
                                         'weights': weights
                                     }, in_plane_invariant_distribution=True)
-    
     # Sample random rotations from S2 points
     # first_moment_1 = vdm1.first_analytical_moment(num_projections_per_s2_point=300, n_theta=350)
     #first_moment_1 = vdm1.first_analytical_moment(num_projections_per_s2_point=64, n_theta=256)
     #first_moment_2 = vdm1.first_analytical_moment(num_projections_per_s2_point=64, n_theta=256)
+    """
     from src.utils.distribution_generation_functions import create_in_plane_invariant_distribution
     diff = 0
     diff_second = 0
     so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
-                                                                        num_in_plane_rotations=200)
+                                                                        num_in_plane_rotations=256)
     vdm = VolumeDistributionModel(vol_ds, rotations=so3_rotations, distribution=so3_weights,
                                     distribution_metadata={
                                         'type': 'vmf_mixture',
                                         'means': mu,
                                         'kappas': kappa,
                                         'weights': weights
-                                    }, in_plane_invariant_distribution=False)
-    first_moment_1 = vdm.first_analytical_moment()
-    second_moment_1 = vdm.second_analytical_moment(batch_size=50, show_progress=True)
-    so3_rotations, so3_weights = create_in_plane_invariant_distribution(quadrature_points, s2_distribution, 
-                                                                        num_in_plane_rotations=200)
-    vdm = VolumeDistributionModel(vol_ds, rotations=so3_rotations, distribution=so3_weights,
-                                    distribution_metadata={
-                                        'type': 'vmf_mixture',
-                                        'means': mu,
-                                        'kappas': kappa,
-                                        'weights': weights
-                                    }, in_plane_invariant_distribution=False)
-    first_moment_2 = vdm.first_analytical_moment()
-    second_moment_2 = vdm.second_analytical_moment(batch_size=50, show_progress=True)
-    diff += np.linalg.norm(first_moment_1 - first_moment_2)
-    diff_second += np.linalg.norm(second_moment_1 - second_moment_2)
-    # --- Compare results ---
-    print(f"Relative difference norm between first moments: {diff/(np.linalg.norm(first_moment_1)):.4e}")
-    print(f"Relative difference norm between second moments: {diff_second/(np.linalg.norm(second_moment_1)):.4e}")
+                                    }, in_plane_invariant_distribution=False, device=device)
+    first_moment = vdm.first_analytical_moment()
+    second_moment = vdm.second_analytical_moment(batch_size=50, show_progress=True)
+
+    def calculate_signal_var(vdm, num_projections=1000):
+        clean = vdm.generate_projections(num_projections=num_projections, sigma=0.0)
+        signal_var = np.mean(clean ** 2)
+        return signal_var
+
+    def snr_to_sigma(snr, signal_var):
+        if snr == np.inf:
+            return 0.0
+        else:
+            sigma = np.sqrt(signal_var / snr)
+        return sigma
+    
+    import matplotlib.pyplot as plt
+    image_counts = np.unique(np.logspace(2, 6, 10, dtype=int))
+    signal_var = calculate_signal_var(vdm, num_projections=10000)
+    signal_noise_ratios = [np.inf, 10, 1, 0.1, 0.01]
+    sigma_values = [snr_to_sigma(snr, signal_var) for snr in signal_noise_ratios]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    colors = plt.cm.viridis(np.linspace(0, 1, len(signal_noise_ratios)))
+
+    
+    for snr, sigma_val, color in zip(signal_noise_ratios, sigma_values, colors):
+        first_rel_diffs = []
+        second_rel_diffs = []
+
+        for n_images in tqdm(image_counts, desc=f"SNR={snr}"):
+            first_moment_empirical, second_moment_empirical = vdm.empirical_moments(
+                num_projections=int(n_images),
+                sigma=sigma_val,
+                batch_size=50,
+                show_progress=False,
+            )
+
+            first_rel = np.linalg.norm(first_moment - first_moment_empirical) / np.linalg.norm(first_moment)
+            second_rel = np.linalg.norm(second_moment - second_moment_empirical) / np.linalg.norm(second_moment)
+
+            first_rel_diffs.append(first_rel)
+            second_rel_diffs.append(second_rel)
+
+        label = "SNR=inf" if np.isinf(snr) else f"SNR={snr:g}"
+        axes[0].loglog(image_counts, first_rel_diffs, marker="o", color=color, label=label)
+        axes[1].loglog(image_counts, second_rel_diffs, marker="s", color=color, label=label)
+
+    tick_fontsize = 20
+    label_fontsize = 18
+    title_fontsize = 22
+    suptitle_fontsize = 26
+    legend_fontsize = 11
+
+    axes[0].set_xlabel("Number of projections", fontsize=label_fontsize)
+    axes[0].set_ylabel("Relative difference", fontsize=label_fontsize)
+    axes[0].set_title("First Moment", fontsize=title_fontsize)
+    axes[0].grid(True, which="both", alpha=0.3)
+    axes[0].legend(fontsize=legend_fontsize)
+    axes[0].tick_params(axis="both", which="major", labelsize=tick_fontsize)
+    axes[0].tick_params(axis="both", which="minor", labelsize=tick_fontsize)
+
+    axes[1].set_xlabel("Number of projections", fontsize=label_fontsize)
+    axes[1].set_ylabel("Relative difference", fontsize=label_fontsize)
+    axes[1].set_title("Second Moment", fontsize=title_fontsize)
+    axes[1].grid(True, which="both", alpha=0.3)
+    axes[1].legend(fontsize=legend_fontsize)
+    axes[1].tick_params(axis="both", which="major", labelsize=tick_fontsize)
+    axes[1].tick_params(axis="both", which="minor", labelsize=tick_fontsize)
+
+    fig.suptitle("Empirical vs Analytical Moment Error", fontsize=suptitle_fontsize)
+    fig.tight_layout()
+    plt.savefig("outputs/tmp_figs/moment_convergence.png")

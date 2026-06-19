@@ -16,7 +16,7 @@ from src.data.emdb_downloader import load_aspire_volume
 from src.utils.distribution_generation_functions import fibonacci_sphere_points
 from src.networks.dpf.sample_generation import build_network_input
 from src.networks.dpf.score_network import S2ScoreNetwork
-from src.networks.dpf.loss import dpf_score_matching_loss, partial_moment_loss
+from src.networks.dpf.loss import dpf_score_matching_loss, partial_moment_loss, wasserstein_loss
 from src.networks.dpf.torch_utils import rotate_s2_function_interpolated
 
 def handle_sigterm(signum, frame):
@@ -388,7 +388,7 @@ def train(local_rank):
             # print(f"[DEBUG] mean t: {t.mean().item()}")
         else:
             final_true_func = batch_func
-            loss = dpf_score_matching_loss(pred_func, final_true_func)
+            loss = wasserstein_loss(pred_func, final_true_func, points)
             final_k_per_item = None
 
         if use_conditional and not drop_cond:
